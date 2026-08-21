@@ -38,6 +38,7 @@ function Write-Log {
 }
 
 Write-Log "=== Restoration test starting for $HostName ==="
+Write-Log "Repository: $env:RESTIC_REPOSITORY"
 
 # ---- 1. Repository integrity check (verifies encryption/auth structures are intact) ----
 Write-Log "Running restic check..."
@@ -50,9 +51,25 @@ if ($LASTEXITCODE -ne 0) {
 Write-Log "restic check passed."
 
 # ---- 2. Pick the latest snapshot ----
-$latest = & restic snapshots --latest 1 --json | ConvertFrom-Json
-if (-not $latest) {
-    Write-Log "RESULT: FAIL - no snapshots found for $HostName"
+Write-Log "Querying snapshots..."
+$snapshotOutput = & restic snapshots --latest 1 --json 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Log "RESULT: FAIL - could not query snapshots for $HostName (restic command failed, not necessarily an empty repository)"
+    Write-Log "restic output: $snapshotOutput"
+    Write-Log "Check: repository path is correct (RESTIC_REPOSITORY=$env:RESTIC_REPOSITORY), credentials/RESTIC_PASSWORD_FILE are set correctly in this session, and network access to the endpoint."
+    exit 1
+}
+
+try {
+    $latest = $snapshotOutput | ConvertFrom-Json
+} catch {
+    Write-Log "RESULT: FAIL - restic command succeeded but output could not be parsed as JSON for $HostName"
+    Write-Log "restic output: $snapshotOutput"
+    exit 1
+}
+
+if (-not $latest -or $latest.Count -eq 0) {
+    Write-Log "RESULT: FAIL - repository reachable but genuinely contains no snapshots for $HostName"
     exit 1
 }
 $snapshotId = $latest[0].short_id
