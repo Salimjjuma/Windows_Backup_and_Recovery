@@ -98,11 +98,53 @@ function Invoke-Backup {
     $resticArgs = @("backup") + $SourcePaths + @(
         "--tag", $HostName,
         "--exclude-file", $ExcludeFile,
-        "--exclude-larger-than", "${MaxFileSizeMB}M"
+        "--exclude-larger-than", "${MaxFileSizeMB}M",
+        "--skip-if-unchanged",
+        "--json"
     )
+    # This runs hidden/non-interactively (no console), so a visual progress
+    # bar has nowhere to render. Instead, restic's --json stream is parsed
+    # and a checkpoint is logged every time progress crosses a new 10%
+    # threshold, so sync.log shows how far a long backup has gotten rather
+    # than just a start line and, eventually, a finish line.
+    $lastLoggedDecile = -1
     try {
-        $output = & restic @resticArgs 2>&1
-        $output | Add-Content -Path $LogFile
+        & restic @resticArgs 2>&1 | ForEach-Object {
+            $line = $_
+            if ($line -is [System.Management.Automation.ErrorRecord]) {
+                Add-Content -Path $LogFile -Value "restic: $line"
+                return
+            }
+            try {
+                $evt = $line | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+                Add-Content -Path $LogFile -Value $line
+                return
+            }
+            switch ($evt.message_type) {
+                "status" {
+                    $pct = [math]::Round($evt.percent_done * 100)
+                    $decile = [math]::Floor($pct / 10)
+                    if ($decile -ne $lastLoggedDecile) {
+                        $lastLoggedDecile = $decile
+                        $doneGB = [math]::Round($evt.bytes_done / 1GB, 2)
+                        $totalGB = [math]::Round($evt.total_bytes / 1GB, 2)
+                        Write-Log "Backup progress: $pct% ($($evt.files_done)/$($evt.total_files) files, ${doneGB}GB/${totalGB}GB)"
+                    }
+                }
+                "summary" {
+                    if ($evt.snapshot_id) {
+                        $addedMB = [math]::Round($evt.data_added / 1MB, 1)
+                        Write-Log "Backup summary: snapshot $($evt.snapshot_id), $($evt.total_files_processed) files processed, ${addedMB}MB new data, $([math]::Round($evt.total_duration,1))s"
+                    } else {
+                        Write-Log "Backup summary: no changes since last snapshot, skipped (--skip-if-unchanged)"
+                    }
+                }
+                default {
+                    Add-Content -Path $LogFile -Value $line
+                }
+            }
+        }
         if ($LASTEXITCODE -eq 0) {
             Write-Log "Backup completed successfully ($Reason)"
         } else {
