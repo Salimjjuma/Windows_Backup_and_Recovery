@@ -19,11 +19,13 @@ param(
     [string]$RestoreRoot = "C:\RestoreTests"
 )
 
-$ErrorActionPreference = "Stop"
-# See install-backup-agent.ps1 for why this is needed on PowerShell 7.3+:
-# native command non-zero exits would otherwise throw and bypass the
-# $LASTEXITCODE checks this script relies on (e.g. restic check / restore
-# failures). Harmless no-op on 5.1.
+$ErrorActionPreference = "Continue"
+# NOT "Stop": this script repeatedly runs restic.exe (check, snapshots,
+# restore) and checks $LASTEXITCODE explicitly. With
+# ErrorActionPreference = "Stop", any text restic writes to stderr gets
+# converted into a terminating exception, bypassing those checks -
+# including cases where restic's own diagnostic output is expected, not
+# a real failure.
 $PSNativeCommandUseErrorActionPreference = $false
 $env:RESTIC_REPOSITORY = "s3:$WasabiEndpoint/$BucketAndPrefix/$HostName"
 # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / RESTIC_PASSWORD_FILE

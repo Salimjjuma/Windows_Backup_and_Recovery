@@ -8,15 +8,16 @@
 # as a Scheduled Task that starts at logon and restarts automatically.
 # =====================================================================
 
-$ErrorActionPreference = "Stop"
-# On PowerShell 7.3+, a native command (restic.exe, icacls, etc.) exiting
-# with a non-zero code is by default converted into a terminating
-# exception, respecting $ErrorActionPreference above - this breaks every
-# "run a command, then check $LASTEXITCODE" pattern in this script, since
-# some of those non-zero exits are expected/normal (e.g. checking whether
-# a repository already exists). Windows PowerShell 5.1 does not do this.
-# Setting this to $false restores the classic behavior this script is
-# written around, on both versions (harmless no-op on 5.1).
+$ErrorActionPreference = "Continue"
+# NOT "Stop": this script repeatedly runs restic.exe and checks
+# $LASTEXITCODE, including cases where a non-zero exit / stderr output is
+# expected and normal (e.g. checking whether a repository already
+# exists). With ErrorActionPreference = "Stop", PowerShell converts any
+# text a native command writes to stderr into a terminating exception
+# BEFORE stream redirection (> $null 2>&1) gets a chance to suppress it -
+# so those checks would throw instead of just setting $LASTEXITCODE.
+# Cmdlet calls below that should hard-fail the script use explicit
+# -ErrorAction Stop instead of relying on this global setting.
 $PSNativeCommandUseErrorActionPreference = $false
 
 # ---- Re-launch elevated if not already admin ----
@@ -69,11 +70,11 @@ if (-not (Test-Path $resticExe)) {
 
     Write-Host "Downloading restic $($release.tag_name) ($arch)..."
     $zipPath = "$env:TEMP\restic.zip"
-    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath -ErrorAction Stop
     $extractDir = "$env:TEMP\restic-extract"
-    Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+    Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force -ErrorAction Stop
     $exeFound = Get-ChildItem -Path $extractDir -Filter "restic*.exe" -Recurse | Select-Object -First 1
-    Copy-Item -Path $exeFound.FullName -Destination $resticExe -Force
+    Copy-Item -Path $exeFound.FullName -Destination $resticExe -Force -ErrorAction Stop
     Remove-Item $zipPath, $extractDir -Recurse -Force
     Write-Host "restic installed to $InstallDir"
 } else {
@@ -159,7 +160,7 @@ if ($LASTEXITCODE -ne 0) {
 # ---- 6. Deploy the watcher script ----
 # (Assumes sync-documents.ps1 sits next to this installer)
 $sourceScript = Join-Path $PSScriptRoot "sync-documents.ps1"
-Copy-Item -Path $sourceScript -Destination $ScriptDest -Force
+Copy-Item -Path $sourceScript -Destination $ScriptDest -Force -ErrorAction Stop
 Write-Host "Watcher script deployed to $ScriptDest"
 
 # ---- 7. Register Scheduled Task: run at logon, restart on failure ----
@@ -190,7 +191,7 @@ $settings = New-ScheduledTaskSettingsSet `
 $principal = New-ScheduledTaskPrincipal -UserId $TaskUser -LogonType S4U -RunLevel Limited
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-    -Settings $settings -Principal $principal -Force | Out-Null
+    -Settings $settings -Principal $principal -Force -ErrorAction Stop | Out-Null
 
 Write-Host "Scheduled task '$TaskName' registered (starts at logon, auto-restarts)."
 

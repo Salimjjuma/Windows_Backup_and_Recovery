@@ -11,10 +11,14 @@
 #   RESTIC_PASSWORD_FILE
 # =====================================================================
 
-$ErrorActionPreference = "Stop"
-# See install-backup-agent.ps1 for why this is needed on PowerShell 7.3+:
-# native command non-zero exits would otherwise throw and bypass the
-# $LASTEXITCODE checks this script relies on. Harmless no-op on 5.1.
+$ErrorActionPreference = "Continue"
+# NOT "Stop": this script repeatedly runs restic.exe and checks
+# $LASTEXITCODE. With ErrorActionPreference = "Stop", any text restic
+# writes to stderr (including normal/expected diagnostic output) gets
+# converted into a terminating exception before it can be logged
+# properly - it would be caught by the outer try/catch as a generic
+# "Backup ERROR", masking the specific $LASTEXITCODE-based failure
+# messages this script is designed to produce.
 $PSNativeCommandUseErrorActionPreference = $false
 
 # ---- Hide this script's own console window ----
