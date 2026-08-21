@@ -9,6 +9,15 @@
 # =====================================================================
 
 $ErrorActionPreference = "Stop"
+# On PowerShell 7.3+, a native command (restic.exe, icacls, etc.) exiting
+# with a non-zero code is by default converted into a terminating
+# exception, respecting $ErrorActionPreference above - this breaks every
+# "run a command, then check $LASTEXITCODE" pattern in this script, since
+# some of those non-zero exits are expected/normal (e.g. checking whether
+# a repository already exists). Windows PowerShell 5.1 does not do this.
+# Setting this to $false restores the classic behavior this script is
+# written around, on both versions (harmless no-op on 5.1).
+$PSNativeCommandUseErrorActionPreference = $false
 
 # ---- Re-launch elevated if not already admin ----
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)

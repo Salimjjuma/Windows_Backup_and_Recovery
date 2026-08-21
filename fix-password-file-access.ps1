@@ -13,6 +13,10 @@
 # =====================================================================
 
 $ErrorActionPreference = "Stop"
+# See install-backup-agent.ps1 for why this is needed on PowerShell 7.3+:
+# native command non-zero exits (icacls, etc.) would otherwise throw
+# instead of just setting $LASTEXITCODE. Harmless no-op on 5.1.
+$PSNativeCommandUseErrorActionPreference = $false
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {

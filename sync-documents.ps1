@@ -12,6 +12,10 @@
 # =====================================================================
 
 $ErrorActionPreference = "Stop"
+# See install-backup-agent.ps1 for why this is needed on PowerShell 7.3+:
+# native command non-zero exits would otherwise throw and bypass the
+# $LASTEXITCODE checks this script relies on. Harmless no-op on 5.1.
+$PSNativeCommandUseErrorActionPreference = $false
 
 # ---- Hide this script's own console window ----
 # The scheduled task already passes -WindowStyle Hidden, but that flag is

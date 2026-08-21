@@ -20,6 +20,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# See install-backup-agent.ps1 for why this is needed on PowerShell 7.3+:
+# native command non-zero exits would otherwise throw and bypass the
+# $LASTEXITCODE checks this script relies on (e.g. restic check / restore
+# failures). Harmless no-op on 5.1.
+$PSNativeCommandUseErrorActionPreference = $false
 $env:RESTIC_REPOSITORY = "s3:$WasabiEndpoint/$BucketAndPrefix/$HostName"
 # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / RESTIC_PASSWORD_FILE
 # are expected to already be set in IT's own environment.
@@ -35,6 +40,57 @@ function Write-Log {
     $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
     Add-Content -Path $logFile -Value $line
     Write-Host $line
+}
+
+# This script runs interactively (an IT admin runs it directly), so unlike
+# the laptop-side background agent, a real progress bar makes sense here.
+# Parses restic's --json event stream and drives Write-Progress from it;
+# also logs a text checkpoint every 10% for the log file record.
+function Invoke-ResticWithProgress {
+    param(
+        [string[]]$ResticArgs,
+        [string]$Activity
+    )
+    $fullArgs = $ResticArgs + @("--json")
+    $lastPercent = -1
+    $lastLoggedDecile = -1
+    & restic @fullArgs 2>&1 | ForEach-Object {
+        $line = $_
+        if ($line -is [System.Management.Automation.ErrorRecord]) {
+            Write-Host $line -ForegroundColor Yellow
+            Add-Content -Path $logFile -Value "restic: $line"
+            return
+        }
+        try {
+            $evt = $line | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            Write-Host $line
+            Add-Content -Path $logFile -Value $line
+            return
+        }
+        if ($evt.message_type -eq "status") {
+            $pct = [math]::Round($evt.percent_done * 100)
+            if ($pct -ne $lastPercent) {
+                $lastPercent = $pct
+                $filesInfo = if ($evt.total_files) { "$($evt.files_done)/$($evt.total_files) files" }
+                             elseif ($evt.total_bytes) { "$($evt.bytes_restored)/$($evt.total_bytes) bytes" }
+                             else { "" }
+                Write-Progress -Activity $Activity -Status "$pct% complete - $filesInfo" -PercentComplete $pct
+            }
+            $decile = [math]::Floor($pct / 10)
+            if ($decile -ne $lastLoggedDecile) {
+                $lastLoggedDecile = $decile
+                Write-Log "$Activity progress: $pct%"
+            }
+        } elseif ($evt.message_type -eq "summary") {
+            Write-Progress -Activity $Activity -Completed
+        } elseif ($evt.message_type -eq "error") {
+            Write-Host "restic error: $($evt.error.message) (item: $($evt.item))" -ForegroundColor Red
+            Add-Content -Path $logFile -Value "restic error: $($evt.error.message) (item: $($evt.item))"
+        }
+    }
+    Write-Progress -Activity $Activity -Completed
+    return $LASTEXITCODE
 }
 
 Write-Log "=== Restoration test starting for $HostName ==="
