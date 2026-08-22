@@ -1,0 +1,78 @@
+name: Scheduled Backup Maintenance Reminders
+
+# Auto-opens a GitHub issue for each recurring maintenance task in
+# Backup_Maintenance_Guide.md, on the cadence that document defines.
+# Add the "maintenance" label's issues to your GitHub Project board -
+# manually the first time, or automatically if you set up a workflow
+# in the Project's own automation settings ("when issue is opened with
+# label X, add to project").
+
+on:
+  schedule:
+    # Weekly spot-check - every Monday 09:00 UTC (Maintenance Guide S3)
+    - cron: '0 9 * * 1'
+    # Monthly cost/version review - 1st of month 09:00 UTC (S6-S7)
+    - cron: '0 9 1 * *'
+    # Quarterly restoration test batch - 1st of Jan/Apr/Jul/Oct (S4)
+    - cron: '0 9 1 1,4,7,10 *'
+    # Annual credential rotation + policy review - Jan 1 (S5, Policy S10)
+    - cron: '0 9 1 1 *'
+  workflow_dispatch: {}  # allows manually triggering a test run from the Actions tab
+
+permissions:
+  issues: write
+
+jobs:
+  create-issue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the appropriate maintenance issue for this schedule
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          REPO="${{ github.repository }}"
+          TODAY=$(date +%Y-%m-%d)
+          MONTH=$(date +%Y-%m)
+          YEAR=$(date +%Y)
+          QUARTER=$(( ($(date +%-m) - 1) / 3 + 1 ))
+
+          # workflow_dispatch has no schedule value - default to the weekly
+          # check so a manual test run has something to demonstrate.
+          EFFECTIVE_SCHEDULE="${SCHEDULE:-0 9 * * 1}"
+
+          case "$EFFECTIVE_SCHEDULE" in
+            "0 9 * * 1")
+              gh issue create --repo "$REPO" \
+                --title "Weekly backup spot-check ($TODAY)" \
+                --label "maintenance,weekly" \
+                --body "Per Maintenance Guide section 3: spot-check 2-3 laptops (rotate through the fleet over ~7 weeks) by running \`restic snapshots --latest 3\` against each. Confirm a recent snapshot exists and looks reasonable. If a laptop looks stale, check its sync.log and scheduled task state before assuming a real problem."
+              ;;
+            "0 9 1 * *")
+              gh issue create --repo "$REPO" \
+                --title "Monthly Wasabi cost & restic version review ($MONTH)" \
+                --label "maintenance,monthly" \
+                --body "Per Maintenance Guide sections 6-7:
+- Check the Wasabi console for storage growth trend and monthly cost, confirm nothing looks abnormal
+- Check https://github.com/restic/restic/releases for a new restic release; note whether a fleet-wide update is warranted this month"
+              ;;
+            "0 9 1 1,4,7,10 *")
+              gh issue create --repo "$REPO" \
+                --title "Quarterly restoration test batch ($YEAR Q$QUARTER)" \
+                --label "maintenance,quarterly,restoration-test" \
+                --body "Per Maintenance Guide section 4: run test-restore.ps1 against enough laptops this quarter that the full fleet gets covered at least once (rotate which laptops were tested last quarter). Log every result. Any FAIL is urgent - investigate immediately, don't queue it for next cycle."
+              ;;
+            "0 9 1 1 *")
+              gh issue create --repo "$REPO" \
+                --title "Annual credential rotation & policy review ($YEAR)" \
+                --label "maintenance,annual,security" \
+                --body "Per Maintenance Guide section 5 and Backup and Recovery Policy section 10:
+- Rotate the restic repository password (all laptops)
+- Rotate all Wasabi access keys
+- Review who currently has access to both
+- Review and update the Backup and Recovery Policy document"
+              ;;
+            *)
+              echo "Unrecognized schedule value: $EFFECTIVE_SCHEDULE - no issue created."
+              ;;
+          esac
