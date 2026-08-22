@@ -52,9 +52,7 @@ jobs:
               gh issue create --repo "$REPO" \
                 --title "Monthly Wasabi cost & restic version review ($MONTH)" \
                 --label "maintenance,monthly" \
-                --body "Per Maintenance Guide sections 6-7:
-- Check the Wasabi console for storage growth trend and monthly cost, confirm nothing looks abnormal
-- Check https://github.com/restic/restic/releases for a new restic release; note whether a fleet-wide update is warranted this month"
+                --body $'Per Maintenance Guide sections 6-7:\n- Check the Wasabi console for storage growth trend and monthly cost, confirm nothing looks abnormal\n- Check https://github.com/restic/restic/releases for a new restic release; note whether a fleet-wide update is warranted this month'
               ;;
             "0 9 1 1,4,7,10 *")
               gh issue create --repo "$REPO" \
@@ -66,11 +64,7 @@ jobs:
               gh issue create --repo "$REPO" \
                 --title "Annual credential rotation & policy review ($YEAR)" \
                 --label "maintenance,annual,security" \
-                --body "Per Maintenance Guide section 5 and Backup and Recovery Policy section 10:
-- Rotate the restic repository password (all laptops)
-- Rotate all Wasabi access keys
-- Review who currently has access to both
-- Review and update the Backup and Recovery Policy document"
+                --body $'Per Maintenance Guide section 5 and Backup and Recovery Policy section 10:\n- Rotate the restic repository password (all laptops)\n- Rotate all Wasabi access keys\n- Review who currently has access to both\n- Review and update the Backup and Recovery Policy document'
               ;;
             *)
               echo "Unrecognized schedule value: $EFFECTIVE_SCHEDULE - no issue created."
