@@ -26,6 +26,16 @@ jobs:
   create-issue:
     runs-on: ubuntu-latest
     steps:
+      - name: Ensure maintenance labels exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO="${{ github.repository }}"
+          for l in maintenance weekly monthly quarterly annual security restoration-test; do
+            gh label create "$l" --repo "$REPO" --color "BFD4F2" \
+              --description "Backup maintenance" --force >/dev/null
+          done
+
       - name: Create the appropriate maintenance issue for this schedule
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -32,7 +32,9 @@ $PSNativeCommandUseErrorActionPreference = $false
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     Write-Host "Relaunching as Administrator..."
-    Start-Process powershell -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    $fwdArgs = "-ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    if ($TaskUser) { $fwdArgs += " -TaskUser `"$TaskUser`"" }
+    Start-Process powershell -Verb RunAs -ArgumentList $fwdArgs
     exit
 }
 
@@ -44,6 +46,16 @@ $HostName   = $env:COMPUTERNAME
 Write-Host ""
 Write-Host "=== Starting Documents Backup Agent Installer for $HostName ==="
 Write-Host ""
+
+# ---- Install progress (0-100% across the 8 steps below) ----
+$TotalSteps = 8
+function Show-InstallProgress {
+    param([int]$Step, [string]$Status)
+    $pct = [math]::Round($Step / $TotalSteps * 100)
+    Write-Progress -Activity "Installing Documents Backup Agent ($HostName)" `
+        -Status "Step $Step of $TotalSteps - $Status" -PercentComplete $pct
+}
+Show-InstallProgress -Step 0 -Status "Collecting credentials"
 $AccessKey = Read-Host "Enter Wasabi Access Key ID"
 $SecretKeySecure = Read-Host "Enter Wasabi Secret Access Key" -AsSecureString
 $SecretKey = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
@@ -65,6 +77,7 @@ New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path $ConfigDir  | Out-Null
 
 # ---- 1. Install restic if not already present ----
+Show-InstallProgress -Step 1 -Status "Installing restic"
 $resticExe = Join-Path $InstallDir "restic.exe"
 if (-not (Test-Path $resticExe)) {
     # Detect OS architecture - 32-bit laptops need the windows_386 build, not windows_amd64
@@ -97,6 +110,7 @@ if ($machinePath -notlike "*$InstallDir*") {
 }
 
 # ---- 2. Create the default excludes file (if not already present) ----
+Show-InstallProgress -Step 2 -Status "Creating excludes file"
 # Media files are excluded by default per IT policy. IT staff can edit
 # this file directly on any laptop to adjust patterns without touching
 # any script.
@@ -121,6 +135,7 @@ desktop.ini
 }
 
 # ---- 3. Store the restic password in a restricted, IT-only-readable file ----
+Show-InstallProgress -Step 3 -Status "Securing repository password"
 # (Not a plain machine env var - this is the key that decrypts everything,
 #  so it gets filesystem ACLs restricting it to SYSTEM, Administrators, and
 #  the specific user account the Scheduled Task runs as. The task runs as
@@ -148,6 +163,7 @@ icacls $PasswordFile /inheritance:r | Out-Null
 icacls $PasswordFile /grant:r "SYSTEM:(R)" "BUILTIN\Administrators:(R)" "${TaskUser}:(R)" | Out-Null
 
 # ---- 4. Set machine-wide environment variables restic needs ----
+Show-InstallProgress -Step 4 -Status "Setting environment variables"
 [Environment]::SetEnvironmentVariable("AWS_ACCESS_KEY_ID", $AccessKey, "Machine")
 [Environment]::SetEnvironmentVariable("AWS_SECRET_ACCESS_KEY", $SecretKey, "Machine")
 [Environment]::SetEnvironmentVariable("RESTIC_REPOSITORY", $Repository, "Machine")
@@ -162,11 +178,13 @@ $env:RESTIC_PASSWORD_FILE = $PasswordFile
 Write-Host "Repository target: $Repository"
 
 # ---- 5. Initialize the repository if it doesn't already exist ----
+Show-InstallProgress -Step 5 -Status "Initializing repository"
 & $resticExe snapshots > $null 2>&1
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Initializing new restic repository..."
     & $resticExe init
     if ($LASTEXITCODE -ne 0) {
+        Write-Progress -Activity "Installing Documents Backup Agent ($HostName)" -Completed
         throw "restic init failed - check Wasabi credentials/bucket name and try again."
     }
     Write-Host "Repository initialized and encrypted."
@@ -175,12 +193,14 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # ---- 6. Deploy the watcher script ----
+Show-InstallProgress -Step 6 -Status "Deploying watcher script"
 # (Assumes sync-documents.ps1 sits next to this installer)
 $sourceScript = Join-Path $PSScriptRoot "sync-documents.ps1"
 Copy-Item -Path $sourceScript -Destination $ScriptDest -Force -ErrorAction Stop
 Write-Host "Watcher script deployed to $ScriptDest"
 
 # ---- 7. Register Scheduled Task: run at logon, restart on failure ----
+Show-InstallProgress -Step 7 -Status "Registering scheduled task"
 $TaskName = "DocumentsBackupSync"
 
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
@@ -213,7 +233,9 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
 Write-Host "Scheduled task '$TaskName' registered (starts at logon, auto-restarts)."
 
 # ---- 8. Start it now for this session too ----
+Show-InstallProgress -Step 8 -Status "Starting backup task"
 Start-ScheduledTask -TaskName $TaskName
+Write-Progress -Activity "Installing Documents Backup Agent ($HostName)" -Completed
 
 Write-Host ""
 Write-Host "=== Install complete ==="

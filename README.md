@@ -256,6 +256,7 @@ recreated cleanly.
 | `install-backup-agent.ps1` | Each staff laptop (once) | Provisions restic, repo, watcher, scheduled task |
 | `sync-documents.ps1` | Each staff laptop (continuously, via Scheduled Task) | Watches + backs up + prunes |
 | `test-restore.ps1` | IT admin machine (on a schedule) | Restoration/integrity testing across laptops |
+| `check-fleet.ps1` | IT admin machine (on demand) | Lists every laptop repo: name, snapshot count, latest time, size |
 
 Questions or issues with this setup should go to [IT lead / distribution
 list — fill in].
