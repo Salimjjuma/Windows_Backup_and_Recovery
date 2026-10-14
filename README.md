@@ -1,3 +1,6 @@
+[![Scheduled Backup Maintenance Reminders](https://github.com/Salimjjuma/Windows_Backup_and_Recovery/actions/workflows/scheduled-maintenance-issues.yml/badge.svg)](https://github.com/Salimjjuma/Windows_Backup_and_Recovery/actions/workflows/scheduled-maintenance-issues.yml)
+
+
 # Laptop Documents Backup — Setup Guide (restic + Wasabi)
 
 Internal IT documentation. Companion to the **Backup and Recovery Policy**.
