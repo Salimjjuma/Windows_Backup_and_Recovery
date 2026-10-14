@@ -1,7 +1,7 @@
 # =====================================================================
 # sync-documents.ps1  (restic edition)
-# Continuously backs up the current user's Documents, Desktop, and
-# Downloads folders to a per-laptop restic repository on Wasabi S3.
+# Continuously backs up the current user's Documents and Desktop
+# folders to a per-laptop restic repository on Wasabi S3.
 # Triggered on file change (debounced) + a periodic failsafe backup +
 # weekly retention pruning. Intended to run under a Scheduled Task at logon.
 #
@@ -38,6 +38,7 @@ $consolePtr = [Console.Window]::GetConsoleWindow()
 [Console.Window]::ShowWindow($consolePtr, 0) | Out-Null   # 0 = SW_HIDE
 
 # ---- Config ----
+# NOTE: Downloads is intentionally NOT backed up (Documents + Desktop only).
 # Get the Downloads folder path (not exposed via GetFolderPath, needs the known-folder GUID)
 # function Get-DownloadsFolder {
 #     $shell = New-Object -ComObject Shell.Application
@@ -58,6 +59,12 @@ $DebounceSec    = 30      # wait this long after last change before backing up
 $FailsafeMin    = 15      # always do a full backup at least this often
 $PruneHours     = 168     # run retention pruning at least this often (weekly)
 $MaxFileSizeMB  = 500     # skip individual files larger than this (installers, ISOs, VM images, etc.)
+
+# Prefer the full restic path: the Scheduled Task may start before a
+# machine-PATH change takes effect, so bare `restic` can fail with
+# "command not found" on first install. Falls back to PATH lookup.
+$ResticExe = Join-Path $env:ProgramFiles "restic\restic.exe"
+if (-not (Test-Path $ResticExe)) { $ResticExe = "restic" }
 
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
@@ -117,7 +124,7 @@ function Invoke-Backup {
     # than just a start line and, eventually, a finish line.
     $lastLoggedDecile = -1
     try {
-        & restic @resticArgs 2>&1 | ForEach-Object {
+        & $ResticExe @resticArgs 2>&1 | ForEach-Object {
             $line = $_
             if ($line -is [System.Management.Automation.ErrorRecord]) {
                 Add-Content -Path $LogFile -Value "restic: $line"
@@ -176,7 +183,7 @@ function Invoke-Prune {
         "--prune"
     )
     try {
-        $output = & restic @forgetArgs 2>&1
+        $output = & $ResticExe @forgetArgs 2>&1
         $output | Add-Content -Path $LogFile
         if ($LASTEXITCODE -eq 0) {
             Write-Log "Retention pruning completed successfully"
@@ -193,6 +200,7 @@ Write-Log "Watched paths: $($SourcePaths -join ', ')"
 Write-Log "Exclude file: $ExcludeFile"
 Write-Log "Max file size: ${MaxFileSizeMB}MB"
 Write-Log "Repository: $env:RESTIC_REPOSITORY"
+Write-Log "restic: $ResticExe"
 
 # Clear any stale lock left behind by an unclean shutdown (sleep, crash,
 # forced logoff) during a previous backup. Safe here specifically because
@@ -203,26 +211,21 @@ Write-Log "Repository: $env:RESTIC_REPOSITORY"
 # moment, this could clear their lock too - an accepted low-probability
 # tradeoff for a system that must otherwise self-recover unattended.
 Write-Log "Checking for stale locks..."
-$unlockOutput = & restic unlock 2>&1
+$unlockOutput = & $ResticExe unlock 2>&1
 $unlockOutput | Add-Content -Path $LogFile
 
 # Initial backup on startup
 Invoke-Backup -Reason "startup"
+$lastFailsafe = Get-Date
+$lastPrune = Get-Date
 
-# ---- File watchers with shared debounce ----
-$debounceTimer = New-Object System.Timers.Timer
-$debounceTimer.Interval = $DebounceSec * 1000
-$debounceTimer.AutoReset = $false
-
-Register-ObjectEvent -InputObject $debounceTimer -EventName Elapsed -Action {
-    Invoke-Backup -Reason "file change"
-} | Out-Null
-
-$onChange = {
-    $debounceTimer.Stop()
-    $debounceTimer.Start()
-}
-
+# ---- File watchers: subscribe WITHOUT -Action scriptblocks ----
+# Register-ObjectEvent -Action blocks run in separate event runspaces and
+# cannot see script functions/variables (Invoke-Backup, $debounceTimer,
+# etc.), so timer+action based triggering silently never fires. Instead,
+# queue raw FileSystemWatcher events and drain them in the main loop below,
+# where Invoke-Backup / Invoke-Prune run in this runspace.
+Get-Event | Remove-Event -ErrorAction SilentlyContinue
 $watchers = @()
 foreach ($path in $SourcePaths) {
     $watcher = New-Object System.IO.FileSystemWatcher
@@ -233,34 +236,38 @@ foreach ($path in $SourcePaths) {
                             [System.IO.NotifyFilters]::FileName -bor `
                             [System.IO.NotifyFilters]::DirectoryName
 
-    Register-ObjectEvent -InputObject $watcher -EventName Changed -Action $onChange | Out-Null
-    Register-ObjectEvent -InputObject $watcher -EventName Created -Action $onChange | Out-Null
-    Register-ObjectEvent -InputObject $watcher -EventName Deleted -Action $onChange | Out-Null
-    Register-ObjectEvent -InputObject $watcher -EventName Renamed -Action $onChange | Out-Null
+    Register-ObjectEvent -InputObject $watcher -EventName Changed | Out-Null
+    Register-ObjectEvent -InputObject $watcher -EventName Created | Out-Null
+    Register-ObjectEvent -InputObject $watcher -EventName Deleted | Out-Null
+    Register-ObjectEvent -InputObject $watcher -EventName Renamed | Out-Null
 
     $watchers += $watcher
     Write-Log "Watcher active on $path"
 }
 
-# ---- Periodic failsafe backup (covers sleep/hibernate, missed events) ----
-$failsafeTimer = New-Object System.Timers.Timer
-$failsafeTimer.Interval = $FailsafeMin * 60 * 1000
-$failsafeTimer.AutoReset = $true
-Register-ObjectEvent -InputObject $failsafeTimer -EventName Elapsed -Action {
-    Invoke-Backup -Reason "failsafe periodic"
-} | Out-Null
-$failsafeTimer.Start()
-
-# ---- Periodic retention pruning ----
-$pruneTimer = New-Object System.Timers.Timer
-$pruneTimer.Interval = $PruneHours * 60 * 60 * 1000
-$pruneTimer.AutoReset = $true
-Register-ObjectEvent -InputObject $pruneTimer -EventName Elapsed -Action {
-    Invoke-Prune
-} | Out-Null
-$pruneTimer.Start()
-
-# Keep the script alive indefinitely, processing events
+# ---- Main loop: debounce + failsafe + prune, all in this runspace ----
+$lastChange = $null
 while ($true) {
-    Wait-Event -Timeout 60 | Out-Null
+    # Drain any queued watcher events; any event means file activity.
+    $evt = Wait-Event -Timeout 5
+    while ($evt) {
+        $lastChange = Get-Date
+        Remove-Event -EventIdentifier $evt.EventIdentifier -ErrorAction SilentlyContinue
+        $evt = Wait-Event -Timeout 0
+    }
+
+    $now = Get-Date
+    if ($lastChange -and ($now - $lastChange).TotalSeconds -ge $DebounceSec) {
+        $lastChange = $null
+        Invoke-Backup -Reason "file change"
+        $lastFailsafe = Get-Date
+    } elseif (($now - $lastFailsafe).TotalMinutes -ge $FailsafeMin) {
+        $lastChange = $null
+        Invoke-Backup -Reason "failsafe periodic"
+        $lastFailsafe = Get-Date
+    }
+    if (($now - $lastPrune).TotalHours -ge $PruneHours) {
+        Invoke-Prune
+        $lastPrune = Get-Date
+    }
 }

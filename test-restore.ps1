@@ -15,7 +15,7 @@ param(
     [string]$HostName,
 
     [string]$WasabiEndpoint = "https://s3.eu-south-1.wasabisys.com",
-    [string]$BucketAndPrefix = "ssrms-bucket",
+    [string]$BucketAndPrefix = "mewabackup",
     [string]$RestoreRoot = "C:\RestoreTests"
 )
 

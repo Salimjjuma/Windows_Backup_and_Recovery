@@ -11,14 +11,14 @@ deployed. Read this before running the install script on any machine.
 ## 1. Overview
 
 Each staff laptop runs a background agent that continuously backs up the
-user's `Documents` folder to a dedicated, encrypted [restic](https://restic.net/)
+user's `Documents` and `Desktop` folders to a dedicated, encrypted [restic](https://restic.net/)
 repository stored in a Wasabi S3 bucket.
 
 | Component | What it does |
 |---|---|
 | `restic` | Backup tool. Encrypts data client-side before upload, deduplicates, versions every snapshot. |
 | Wasabi S3 bucket | Remote storage target. One prefix per laptop, one repository per laptop. |
-| `sync-documents.ps1` | Runs continuously on the laptop. Watches Documents for changes, triggers backups, prunes old snapshots. |
+| `sync-documents.ps1` | Runs continuously on the laptop. Watches Documents + Desktop for changes, triggers backups, prunes old snapshots. |
 | `install-backup-agent.ps1` | One-time setup script. Installs restic, provisions the repo, deploys the watcher, registers the scheduled task. |
 | `test-restore.ps1` | Run centrally by IT (not on laptops). Restores a snapshot to verify backups are actually recoverable. |
 
@@ -60,7 +60,7 @@ Before first use, open `install-backup-agent.ps1` and `test-restore.ps1`
 and replace the placeholder bucket name:
 
 ```powershell
-$BucketAndPrefix = "mybucket/restic-repos"   # <-- change "mybucket"
+$BucketAndPrefix = "mewabackup"   # <-- change to your actual bucket name
 ```
 
 ---
@@ -72,6 +72,9 @@ $BucketAndPrefix = "mybucket/restic-repos"   # <-- change "mybucket"
 2. Run PowerShell **as the IT technician performing setup**:
 ```powershell
    powershell -ExecutionPolicy Bypass -File install-backup-agent.ps1
+   # If no user is logged on at install time, or the wrong user is
+   # auto-detected, specify the staff owner explicitly:
+   # powershell -ExecutionPolicy Bypass -File install-backup-agent.ps1 -TaskUser "DOMAIN\staffuser"
 ```
 3. It will prompt to elevate (accept the UAC prompt) if not already
    running as admin.
@@ -84,7 +87,7 @@ $BucketAndPrefix = "mybucket/restic-repos"   # <-- change "mybucket"
      if already present)
    - Store the repository password in
      `C:\ProgramData\DocBackup\restic-password.txt`, locked down via
-     `icacls` to `SYSTEM` and `Administrators` only
+     `icacls` to `SYSTEM`, `Administrators`, and the staff owner the task runs as
    - Set machine-wide environment variables (`AWS_ACCESS_KEY_ID`,
      `AWS_SECRET_ACCESS_KEY`, `RESTIC_REPOSITORY`, `RESTIC_PASSWORD_FILE`)
    - Run `restic init` to create the encrypted repository (skipped if one
@@ -105,7 +108,7 @@ Once installed, no user action is required. Mechanically:
 - On logon, the Scheduled Task launches `sync-documents.ps1` in the
   background (hidden window).
 - It runs an **immediate backup on startup**.
-- A `FileSystemWatcher` monitors the Documents folder. Any change
+- A `FileSystemWatcher` monitors the Documents and Desktop folders. Any change
   (create/edit/delete/rename) starts a **30-second debounce timer** — if no
   further changes occur, a backup runs. This avoids triggering a backup on
   every keystroke of an open file while still capturing changes within

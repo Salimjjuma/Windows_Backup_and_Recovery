@@ -8,6 +8,14 @@
 # as a Scheduled Task that starts at logon and restarts automatically.
 # =====================================================================
 
+param(
+    # Staff owner's logon (DOMAIN\user). If omitted, auto-detected from the
+    # current console session (Win32_ComputerSystem.UserName). Do NOT default
+    # to $env:USERNAME here: under elevation that is the IT admin account,
+    # not the staff owner, and the task would watch the wrong profile.
+    [string]$TaskUser = ""
+)
+
 $ErrorActionPreference = "Continue"
 # NOT "Stop": this script repeatedly runs restic.exe and checks
 # $LASTEXITCODE, including cases where a non-zero exit / stderr output is
@@ -30,7 +38,7 @@ if (-not $isAdmin) {
 
 # ---- Config: Wasabi connection details ----
 $WasabiEndpoint = "https://s3.eu-south-1.wasabisys.com"
-$BucketAndPrefix = "ssrms-bucket"   # <-- set your actual bucket name here
+$BucketAndPrefix = "mewabackup"   # <-- set your actual bucket name here
 $HostName   = $env:COMPUTERNAME
 
 Write-Host ""
@@ -122,7 +130,16 @@ desktop.ini
 # Reset any ACL left over from a previous install run before writing, so
 # this script is safe to re-run (e.g. to rotate the password or update
 # other components) without locking itself out.
-$TaskUser = "$env:USERDOMAIN\$env:USERNAME"
+# Resolve the staff owner the task will run as: prefer the logged-on console
+# user, NOT $env:USERNAME (under elevation that's the IT admin, whose
+# Documents/Desktop are not what we want to back up). -TaskUser overrides.
+if (-not $TaskUser) {
+    $loggedOn = $null
+    try { $loggedOn = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).UserName } catch { }
+    if ($loggedOn) { $TaskUser = $loggedOn }
+    else { $TaskUser = "$env:USERDOMAIN\$env:USERNAME" }
+}
+Write-Host "Scheduled task will run as: $TaskUser"
 if (Test-Path $PasswordFile) {
     icacls $PasswordFile /reset | Out-Null
 }
@@ -200,7 +217,7 @@ Start-ScheduledTask -TaskName $TaskName
 
 Write-Host ""
 Write-Host "=== Install complete ==="
-Write-Host "Backing up: Documents, Desktop, and Downloads folders"
+Write-Host "Backing up: Documents and Desktop folders"
 Write-Host "Repository: $Repository"
 Write-Host "Encryption: restic (AES-256-CTR + Poly1305), password stored in $PasswordFile (restricted to SYSTEM/Administrators)"
 Write-Host "Logs: $ConfigDir\sync.log"
