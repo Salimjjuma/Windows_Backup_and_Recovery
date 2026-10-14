@@ -59,6 +59,7 @@ $DebounceSec    = 30      # wait this long after last change before backing up
 $FailsafeMin    = 15      # always do a full backup at least this often
 $PruneHours     = 168     # run retention pruning at least this often (weekly)
 $MaxFileSizeMB  = 500     # skip individual files larger than this (installers, ISOs, VM images, etc.)
+$MaxLogSizeMB   = 10      # rotate sync.log once it exceeds this (keeps newest lines, archives rest to sync.log.1)
 
 # Prefer the full restic path: the Scheduled Task may start before a
 # machine-PATH change takes effect, so bare `restic` can fail with
@@ -196,6 +197,19 @@ function Invoke-Prune {
 }
 
 Write-Log "=== sync-documents (restic) starting for $HostName ==="
+# Rotate sync.log so it can't grow forever: 15-minute backups + progress
+# lines append constantly. Keeps the newest ~2000 lines live, archives the
+# rest to sync.log.1 (overwritten each rotation).
+try {
+    if ((Test-Path $LogFile) -and ((Get-Item $LogFile -ErrorAction Stop).Length -gt ($MaxLogSizeMB * 1MB))) {
+        $tail = Get-Content -Path $LogFile -Tail 2000 -ErrorAction Stop
+        Move-Item -Path $LogFile -Destination "$LogFile.1" -Force -ErrorAction Stop
+        $tail | Set-Content -Path $LogFile -ErrorAction Stop
+        Write-Log "sync.log rotated (exceeded ${MaxLogSizeMB}MB, newest lines kept, rest archived to sync.log.1)"
+    }
+} catch {
+    Write-Log "sync.log rotation skipped: $_"
+}
 Write-Log "Watched paths: $($SourcePaths -join ', ')"
 Write-Log "Exclude file: $ExcludeFile"
 Write-Log "Max file size: ${MaxFileSizeMB}MB"
