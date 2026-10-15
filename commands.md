@@ -18,7 +18,8 @@ powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1 -TaskUser "D
 powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1 -ExtraPaths "C:\Users\Public"
 powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1 -ExtraPaths "C:\Users\Public","D:\Work"
 
-# Re-run (e.g. deploy a new watcher version). Prompts for keys again.
+# Re-run (e.g. deploy a new watcher version, or add -ExtraPaths).
+# Saved keys/password are offered as [Enter to keep] — type only to rotate.
 # restic init is skipped if the repo exists; task is recreated cleanly.
 powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1
 ```

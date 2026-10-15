@@ -63,26 +63,69 @@ function Show-InstallProgress {
         -Status "Step $Step of $TotalSteps - $Status" -PercentComplete $pct
 }
 Show-InstallProgress -Step 0 -Status "Collecting credentials"
-$AccessKey = Read-Host "Enter Wasabi Access Key ID"
-$SecretKeySecure = Read-Host "Enter Wasabi Secret Access Key" -AsSecureString
-$SecretKey = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecretKeySecure)
-)
-$ResticPasswordSecure = Read-Host "Enter the restic repository encryption password (same for all laptops, kept by IT only)" -AsSecureString
-$ResticPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($ResticPasswordSecure)
-)
+$InstallDir = "C:\Program Files\restic"
+$ConfigDir  = "$env:ProgramData\DocBackup"
+$ScriptDest = Join-Path $ConfigDir "sync-documents.ps1"
+$PasswordFile = Join-Path $ConfigDir "restic-password.txt"
+
+# Re-run friendly: default to already-saved machine values so Enter keeps
+# them (e.g. when re-running just to add -ExtraPaths or update the
+# watcher). Typing a value rotates it.
+$savedAccess = [Environment]::GetEnvironmentVariable("AWS_ACCESS_KEY_ID", "Machine")
+$savedSecret = [Environment]::GetEnvironmentVariable("AWS_SECRET_ACCESS_KEY", "Machine")
+$savedPwFile = [Environment]::GetEnvironmentVariable("RESTIC_PASSWORD_FILE", "Machine")
+$effectivePwFile = if ($savedPwFile) { $savedPwFile } else { $PasswordFile }
+$savedPwExists = $false
+try { $savedPwExists = Test-Path $effectivePwFile } catch { }
+
+if ($savedAccess) {
+    $masked = $savedAccess.Substring(0, [Math]::Min(4, $savedAccess.Length)) + "..."
+    $inKey = Read-Host "Enter Wasabi Access Key ID [Enter to keep existing '$masked']"
+    $AccessKey = if ($inKey -and $inKey.Trim()) { $inKey.Trim() } else { $savedAccess }
+} else {
+    $AccessKey = Read-Host "Enter Wasabi Access Key ID"
+}
+if ($savedSecret) {
+    $inSecretSecure = Read-Host "Enter Wasabi Secret Access Key [Enter to keep saved]" -AsSecureString
+    $inSecret = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($inSecretSecure)
+    )
+    $SecretKey = if ($inSecret) { $inSecret } else { $savedSecret }
+} else {
+    $SecretKeySecure = Read-Host "Enter Wasabi Secret Access Key" -AsSecureString
+    $SecretKey = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecretKeySecure)
+    )
+}
+if ($savedPwExists) {
+    $inPwSecure = Read-Host "Enter the restic repository encryption password [Enter to keep existing file]" -AsSecureString
+    $inPw = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($inPwSecure)
+    )
+    if ($inPw) {
+        $ResticPassword = $inPw
+    } else {
+        try { $ResticPassword = Get-Content -Path $effectivePwFile -Raw -ErrorAction Stop }
+        catch {
+            Write-Host "Could not read existing password file, please enter the password."
+            $retrySecure = Read-Host "Enter the restic repository encryption password (same for all laptops, kept by IT only)" -AsSecureString
+            $ResticPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                [Runtime.InteropServices.Marshal]::SecureStringToBSTR($retrySecure)
+            )
+        }
+    }
+} else {
+    $ResticPasswordSecure = Read-Host "Enter the restic repository encryption password (same for all laptops, kept by IT only)" -AsSecureString
+    $ResticPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($ResticPasswordSecure)
+    )
+}
 if (-not $ExtraPaths -or $ExtraPaths.Count -eq 0) {
     $extraAnswer = Read-Host "Extra folders to back up on THIS laptop, comma-separated (e.g. C:\Users\Public) [Enter to skip]"
     if ($extraAnswer -and $extraAnswer.Trim()) {
         $ExtraPaths = @($extraAnswer -split "[,;]" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     }
 }
-
-$InstallDir = "C:\Program Files\restic"
-$ConfigDir  = "$env:ProgramData\DocBackup"
-$ScriptDest = Join-Path $ConfigDir "sync-documents.ps1"
-$PasswordFile = Join-Path $ConfigDir "restic-password.txt"
 
 $Repository = "s3:$WasabiEndpoint/$BucketAndPrefix/$HostName"
 
