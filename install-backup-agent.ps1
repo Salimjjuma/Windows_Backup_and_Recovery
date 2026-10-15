@@ -72,6 +72,12 @@ $ResticPasswordSecure = Read-Host "Enter the restic repository encryption passwo
 $ResticPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
     [Runtime.InteropServices.Marshal]::SecureStringToBSTR($ResticPasswordSecure)
 )
+if (-not $ExtraPaths -or $ExtraPaths.Count -eq 0) {
+    $extraAnswer = Read-Host "Extra folders to back up on THIS laptop, comma-separated (e.g. C:\Users\Public) [Enter to skip]"
+    if ($extraAnswer -and $extraAnswer.Trim()) {
+        $ExtraPaths = @($extraAnswer -split "[,;]" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+}
 
 $InstallDir = "C:\Program Files\restic"
 $ConfigDir  = "$env:ProgramData\DocBackup"
