@@ -26,6 +26,9 @@ $ErrorActionPreference = "Continue"
 $PSNativeCommandUseErrorActionPreference = $false
 
 # ---- Preflight ----
+# Drop blank entries so -HostNames "",("PC-1","") etc. fall through to
+# discovery (or the empty-repo error) instead of querying a garbage path.
+$HostNames = @($HostNames | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
 foreach ($v in @("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "RESTIC_PASSWORD_FILE")) {
     if (-not [Environment]::GetEnvironmentVariable($v)) {
         Write-Warning "$v is not set in this session - restic calls will likely fail."

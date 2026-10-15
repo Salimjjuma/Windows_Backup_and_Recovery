@@ -13,7 +13,11 @@ param(
     # current console session (Win32_ComputerSystem.UserName). Do NOT default
     # to $env:USERNAME here: under elevation that is the IT admin account,
     # not the staff owner, and the task would watch the wrong profile.
-    [string]$TaskUser = ""
+    [string]$TaskUser = "",
+
+    # Extra folders to back up on THIS laptop only (e.g. "C:\Users\Public").
+    # Appended (deduped) to extra-paths.txt on every run, including re-runs.
+    [string[]]$ExtraPaths = @()
 )
 
 $ErrorActionPreference = "Continue"
@@ -34,6 +38,9 @@ if (-not $isAdmin) {
     Write-Host "Relaunching as Administrator..."
     $fwdArgs = "-ExecutionPolicy Bypass -File `"$PSCommandPath`""
     if ($TaskUser) { $fwdArgs += " -TaskUser `"$TaskUser`"" }
+    if ($ExtraPaths -and $ExtraPaths.Count -gt 0) {
+        $fwdArgs += " -ExtraPaths " + (($ExtraPaths | ForEach-Object { "'$_'" }) -join ",")
+    }
     Start-Process powershell -Verb RunAs -ArgumentList $fwdArgs
     exit
 }
@@ -132,6 +139,24 @@ desktop.ini
     Write-Host "Default excludes file created at $ExcludeFile"
 } else {
     Write-Host "Excludes file already exists at $ExcludeFile, leaving as-is."
+}
+
+# ---- 2b. Per-machine extra backup folders (this laptop only) ----
+# Appended (deduped), never overwritten, so re-runs are safe. The watcher
+# unions these with Documents + Desktop at runtime.
+$ExtraPathsFile = Join-Path $ConfigDir "extra-paths.txt"
+$cleanExtra = @($ExtraPaths | ForEach-Object { "$_".Trim() } |
+    Where-Object { $_ -and -not $_.StartsWith("#") } |
+    Select-Object -Unique)
+if ($cleanExtra.Count -gt 0) {
+    $existing = @()
+    if (Test-Path $ExtraPathsFile) {
+        $existing = @(Get-Content -Path $ExtraPathsFile |
+            ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+    @($existing + $cleanExtra | Select-Object -Unique) |
+        Set-Content -Path $ExtraPathsFile
+    Write-Host "Extra backup folders recorded in $ExtraPathsFile"
 }
 
 # ---- 3. Store the restic password in a restricted, IT-only-readable file ----

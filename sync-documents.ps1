@@ -1,7 +1,8 @@
 # =====================================================================
 # sync-documents.ps1  (restic edition)
 # Continuously backs up the current user's Documents and Desktop
-# folders to a per-laptop restic repository on Wasabi S3.
+# folders (plus any extra folders listed in extra-paths.txt) to a
+# per-laptop restic repository on Wasabi S3.
 # Triggered on file change (debounced) + a periodic failsafe backup +
 # weekly retention pruning. Intended to run under a Scheduled Task at logon.
 #
@@ -99,6 +100,26 @@ function Write-Log {
     param([string]$Message)
     $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
     Add-Content -Path $LogFile -Value $line
+}
+
+# Per-machine extra folders (e.g. C:\Users\Public on laptops that need it).
+# Optional file: one absolute path per line, # for comments, blank lines
+# ignored. Entries must exist (warn-and-skip otherwise) and are deduplicated
+# against the built-in Documents + Desktop set. Same repo, same hostname
+# tag, same excludes/size cap as everything else.
+$ExtraPathsFile = Join-Path $LogDir "extra-paths.txt"
+if (Test-Path $ExtraPathsFile) {
+    $ExtraPaths = Get-Content -Path $ExtraPathsFile |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and -not $_.StartsWith("#") } |
+        ForEach-Object {
+            if (-not [IO.Path]::IsPathRooted($_)) { Write-Log "Extra path skipped (not absolute): $_"; return }
+            if (-not (Test-Path $_)) { Write-Log "Extra path skipped (not found): $_"; return }
+            $_
+        } | Select-Object -Unique
+    if ($ExtraPaths) {
+        $SourcePaths = @($SourcePaths + $ExtraPaths | Select-Object -Unique)
+    }
 }
 
 function Invoke-Backup {

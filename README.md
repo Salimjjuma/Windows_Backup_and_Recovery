@@ -78,6 +78,8 @@ $BucketAndPrefix = "mewabackup"   # <-- change to your actual bucket name
    # If no user is logged on at install time, or the wrong user is
    # auto-detected, specify the staff owner explicitly:
    # powershell -ExecutionPolicy Bypass -File install-backup-agent.ps1 -TaskUser "DOMAIN\staffuser"
+   # If this laptop also needs extra folders backed up (e.g. the Public folder):
+   # powershell -ExecutionPolicy Bypass -File install-backup-agent.ps1 -ExtraPaths "C:\Users\Public"
 ```
 3. It will prompt to elevate (accept the UAC prompt) if not already
    running as admin.
@@ -121,6 +123,10 @@ Once installed, no user action is required. Mechanically:
 - Every **7 days**, `restic forget --prune` runs to enforce retention
   (`--keep-daily 14 --keep-weekly 8 --keep-monthly 12`), so the bucket
   doesn't grow unbounded while still preserving a meaningful history.
+- Laptops with extra needs (e.g. the Public folder) list one absolute path
+  per line in `C:\ProgramData\DocBackup\extra-paths.txt` (written by
+  `install-backup-agent.ps1 -ExtraPaths`, appended on re-runs). These are
+  backed up under the same repo and hostname tag.
 - All activity is logged to `C:\ProgramData\DocBackup\sync.log` on the
   laptop itself.
 
@@ -223,6 +229,15 @@ restic restore latest --target C:\Temp\restore --include "path\to\file.docx"
 Get-Content C:\ProgramData\DocBackup\sync.log -Tail 50
 ```
 
+**Fleet dashboard (for non-CLI users):**
+```powershell
+# On the IT admin machine, with the same env vars set as for test-restore.ps1:
+python fleet-dashboard.py
+# Then open http://127.0.0.1:8080 - enter hostnames (or Discover from the
+# bucket), Check fleet now, and download the CSV/HTML report.
+# Needs Python 3.8+ and restic on PATH. No packages to install.
+```
+
 **Re-run install on a laptop already provisioned** (e.g. to update the
 watcher script version): safe to do — `restic init` is skipped if the
 repository already exists, and the Scheduled Task is unregistered and
@@ -260,6 +275,7 @@ recreated cleanly.
 | `sync-documents.ps1` | Each staff laptop (continuously, via Scheduled Task) | Watches + backs up + prunes |
 | `test-restore.ps1` | IT admin machine (on a schedule) | Restoration/integrity testing across laptops |
 | `check-fleet.ps1` | IT admin machine (on demand) | Lists every laptop repo: name, snapshot count, latest time, size |
+| `fleet-dashboard.py` | IT admin machine (local web UI) | Same fleet check as `check-fleet.ps1` in a browser, with CSV/HTML reports |
 
 Questions or issues with this setup should go to [IT lead / distribution
 list — fill in].
