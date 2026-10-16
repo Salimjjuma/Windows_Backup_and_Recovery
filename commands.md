@@ -107,6 +107,33 @@ python fleet-dashboard.py
 python fleet-dashboard.py --port 8080
 ```
 
+### 7b. Fleet checks from Linux / Ubuntu (IT admin machine or any Linux box)
+
+Same checks as `check-fleet.ps1`, no manual setup: `./check-fleet.sh`
+auto-installs `restic` (latest GitHub release) and, only for auto-discovery,
+AWS CLI v2 (via `sudo apt-get` / official installers).
+
+```bash
+chmod +x check-fleet.sh
+
+# Credentials (scoped backup-laptops user is enough; root keys also work):
+export AWS_ACCESS_KEY_ID="<key>"
+export AWS_SECRET_ACCESS_KEY="<secret>"
+export RESTIC_PASSWORD_FILE="$HOME/.restic-password"   # chmod 600, never commit
+# optional overrides (defaults: eu-south-1 / mewabackup):
+# export WASABI_ENDPOINT="https://s3.eu-south-1.wasabisys.com"
+# export BUCKET="mewabackup"
+
+# Explicit hostnames (no AWS CLI needed):
+./check-fleet.sh LAPTOP-1 LAPTOP-2
+./check-fleet.sh --hostnames LAPTOP-1,LAPTOP-2 --csv fleet.csv
+
+# Discover all repos via AWS CLI:
+./check-fleet.sh
+```
+
+Exit code is 1 if any laptop FAILs (usable in cron/CI).
+
 ## 8. Restoration tests (IT admin machine)
 
 ```powershell
