@@ -16,10 +16,13 @@ Then open http://127.0.0.1:8080 in a browser.
 """
 
 import argparse
+import base64
 import concurrent.futures
 import csv
 import html
 import io
+import json
+import math
 import json
 import os
 import shutil
@@ -37,6 +40,7 @@ DEFAULTS = {
     "endpoint": "https://s3.eu-south-1.wasabisys.com",
     "bucket": "mewabackup",
     "hostnames": [],
+    "stale_hours": 24,
 }
 
 JOBS = {}
@@ -171,13 +175,70 @@ def report_csv(results):
     return buf.getvalue()
 
 
+def pie_svg(items, size=220):
+    """Offline SVG pie chart of per-repo byte usage. No JS or CDN needed."""
+    total = sum(b for _, b in items)
+    if total <= 0 or not items:
+        return ""
+    cx = cy = size / 2
+    r = size / 2 - 10
+    parts = []
+    angle = -math.pi / 2
+    n = len(items)
+    for i, (label, b) in enumerate(items):
+        color = f"hsl({int(i * 360 / n)} 65% 55%)"
+        frac = b / total
+        if n == 1:
+            parts.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="{color}"/>')
+            continue
+        a2 = angle + frac * 2 * math.pi
+        x1, y1 = cx + r * math.cos(angle), cy + r * math.sin(angle)
+        x2, y2 = cx + r * math.cos(a2), cy + r * math.sin(a2)
+        large = 1 if frac > 0.5 else 0
+        parts.append(
+            f'<path d="M{cx:.1f},{cy:.1f} L{x1:.1f},{y1:.1f} '
+            f'A{r:.1f},{r:.1f} 0 {large},1 {x2:.1f},{y2:.1f} Z" fill="{color}"/>')
+        angle = a2
+    legend = "\n".join(
+        '<li><span style="display:inline-block;width:12px;height:12px;'
+        f'background:hsl({int(i * 360 / n)} 65% 55%)"></span> '
+        f'{html.escape(label)} - {html.escape(format_bytes(b))} '
+        f'({b / total * 100:.1f}%)</li>'
+        for i, (label, b) in enumerate(items))
+    return (f'<h2>Utilization</h2><div style="display:flex;gap:24px;align-items:center;flex-wrap:wrap">'
+            f'<svg width="{size}" height="{size}" viewBox="0 0 {size} {size}">'
+            f'{"".join(parts)}</svg><ul class="list-unstyled">{legend}</ul></div>')
+
+
 def report_html(results, endpoint, bucket):
     ok = sum(1 for r in results if r.get("status") == "OK")
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    known = [r.get("sizeBytes") for r in results
+             if isinstance(r.get("sizeBytes"), int)]
+    total_snaps = sum(r.get("snapshots", 0) for r in results
+                      if isinstance(r.get("snapshots"), int))
+    if known:
+        total_line = (f"Total size used: <strong>{html.escape(format_bytes(sum(known)))}</strong>"
+                      f" (across {len(known)} of {len(results)} repositorie(s))")
+        total_size_cell = html.escape(format_bytes(sum(known)))
+        chart = pie_svg([(str(r.get("name", "")), r.get("sizeBytes"))
+                         for r in results
+                         if isinstance(r.get("sizeBytes"), int)])
+    else:
+        total_line = "Total size used: <strong>unknown</strong>"
+        total_size_cell = "unknown"
+        chart = ""
+    try:
+        with open(os.path.join(BASE_DIR, "assets", "logo.jpeg"), "rb") as f:
+            logo_img = ('<img src="data:image/jpeg;base64,{}" alt="Mewa logo" '
+                        'style="height:56px;width:auto">').format(
+                            base64.b64encode(f.read()).decode("ascii"))
+    except OSError:
+        logo_img = ""
     rows = "\n".join(
         "<tr><td>{}</td><td class='{}'>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
             html.escape(str(r.get("name", ""))),
-            "ok" if r.get("status") == "OK" else "fail",
+            "text-success fw-bold" if r.get("status") == "OK" else "text-danger fw-bold",
             html.escape(str(r.get("status", ""))),
             html.escape(str(r.get("snapshots", 0))),
             html.escape(str(r.get("latest", ""))),
@@ -186,18 +247,22 @@ def report_html(results, endpoint, bucket):
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <title>Mewa Backup and Restore - SP ICT-1 2026-2030 - {html.escape(stamp)}</title>
-<style>body{{font-family:sans-serif;margin:2em}}table{{border-collapse:collapse;width:100%}}
-th,td{{border:1px solid #ccc;padding:6px 10px;text-align:left}}th{{background:#f0f0f0}}
-.ok{{color:green;font-weight:bold}}.fail{{color:red;font-weight:bold}}</style>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 </head><body>
-<h1>Mewa Backup and Restore - SP ICT-1 2026-2030</h1>
-<p>Generated {html.escape(stamp)} - bucket <code>{html.escape(bucket)}</code>
-via <code>{html.escape(endpoint)}</code></p>
-<p><strong>{ok} OK, {len(results) - ok} FAIL</strong> out of {len(results)} checked.</p>
-<table><tr><th>Name</th><th>Status</th><th>Snapshots</th><th>Latest</th><th>Size</th></tr>
-{rows}</table>
-<p><button onclick="window.print()">Print</button></p>
-</body></html>"""
+<nav class="navbar navbar-dark bg-dark mb-4"><div class="container">
+<span class="navbar-brand d-flex align-items-center gap-3">{logo_img}Mewa Backup and Restore - SP ICT-1 2026-2030</span>
+</div></nav>
+<div class="container" style="max-width:1000px">
+<table class="table table-bordered w-auto"><tr><th>Generated</th><th>Bucket</th><th>Endpoint</th></tr>
+<tr><td>{html.escape(stamp)}</td><td><code>{html.escape(bucket)}</code></td><td><code>{html.escape(endpoint)}</code></td></tr></table>
+<p class="alert alert-info"><strong>{ok} OK, {len(results) - ok} FAIL</strong> out of {len(results)} checked.<br>{total_line}.</p>
+<table class="table table-striped table-hover"><thead class="table-light"><tr><th>Name</th><th>Status</th><th>Snapshots</th><th>Latest</th><th>Size</th></tr></thead><tbody>
+{rows}
+<tr class="table-group-divider fw-bold"><td>Total</td><td></td><td>{total_snaps}</td><td></td><td>{total_size_cell}</td></tr></tbody></table>
+{chart}
+<p><button class="btn btn-secondary d-print-none" onclick="window.print()">Print</button></p>
+<footer class="mt-4 pt-3 border-top text-muted d-flex justify-content-between flex-wrap gap-2"><span>Prepared By: ICT Department</span><span>Report generated: {html.escape(stamp)}</span></footer>
+</div></body></html>"""
 
 
 # ---------------------------------------------------------------- web UI
@@ -205,67 +270,96 @@ via <code>{html.escape(endpoint)}</code></p>
 PAGE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mewa Backup and Restore - SP ICT-1 2026-2030</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <style>
-body{font-family:sans-serif;margin:2em;max-width:1000px}
-.brand{display:flex;align-items:center;gap:14px}
-.brand img{height:56px;width:auto}
-textarea{width:100%;height:120px;font-family:monospace}
-input[type=text]{width:100%;box-sizing:border-box}
-.ok{color:green;font-weight:bold}.fail{color:red;font-weight:bold}
-.warn{background:#fff3cd;border:1px solid #e6c200;padding:8px;margin:8px 0}
-table{border-collapse:collapse;width:100%;margin-top:1em}
-th,td{border:1px solid #ccc;padding:6px 10px;text-align:left}th{background:#f0f0f0}
-#bar{height:12px;background:#eee;margin:8px 0}#bar>div{height:100%;width:0;background:#4a90d9}
-button{margin:4px 4px 4px 0;padding:6px 12px}
-.row{display:flex;gap:12px}.row>div{flex:1}
+textarea{height:120px;font-family:monospace}
+label.form-label{display:block}
+.ok{color:var(--bs-success);font-weight:bold}.fail{color:var(--bs-danger);font-weight:bold}
+.navbar-brand img{height:40px;width:auto}
+#tbl{margin-top:1em}
+#tbl th{cursor:pointer;user-select:none;white-space:nowrap}
 </style></head><body>
-<div class="brand"><img src="/assets/logo.jpeg" alt="Mewa logo"><h1>Mewa Backup and Restore - SP ICT-1 2026-2030</h1></div>
+<nav class="navbar navbar-dark bg-dark mb-4"><div class="container">
+<a class="navbar-brand d-flex align-items-center gap-3" href="#"><img src="/assets/logo.jpeg" alt="Mewa logo"><span>Mewa Backup and Restore - SP ICT-1 2026-2030</span></a>
+</div></nav>
+<div class="container" style="max-width:1000px">
 <div id="env"></div>
-<h2>Settings</h2>
-<div class="row"><div><label>Wasabi endpoint<br><input type="text" id="endpoint"></label></div>
-<div><label>Bucket<br><input type="text" id="bucket"></label></div></div>
-<label>Hostnames (one per line)<br><textarea id="hosts"></textarea></label><br>
-<button onclick="save()">Save settings</button>
-<button onclick="discover()">Discover from bucket</button>
-<span id="saved"></span>
-<h2>Check</h2>
-<button id="checkBtn" onclick="startCheck()">Check fleet now</button>
-<button id="csvBtn" onclick="dl('csv')" disabled>Download CSV report</button>
-<button id="htmlBtn" onclick="dl('html')" disabled>Download HTML report</button>
-<div id="bar"><div></div></div>
-<div id="summary"></div>
-<table id="tbl" hidden><tr><th>Name</th><th>Status</th><th>Snapshots</th><th>Latest</th><th>Size</th></tr></table>
+<div class="card mb-4"><div class="card-body">
+<h2 class="card-title h4">Settings</h2>
+<div class="row g-3"><div class="col-md-4"><label class="form-label">Wasabi endpoint<input type="text" class="form-control" id="endpoint"></label></div>
+<div class="col-md-4"><label class="form-label">Bucket<input type="text" class="form-control" id="bucket"></label></div>
+<div class="col-md-4"><label class="form-label">Stale threshold (hours)<input type="number" class="form-control" id="staleHours" min="1" max="720"></label></div></div>
+<label class="form-label mt-3">Hostnames (one per line)<textarea class="form-control" id="hosts"></textarea></label>
+<div class="mt-3"><button class="btn btn-primary" onclick="save()">Save settings</button>
+<button id="discBtn" class="btn btn-outline-secondary" onclick="discover()">Discover from bucket</button>
+<span id="saved" class="text-muted ms-2"></span></div>
+</div></div>
+<div class="card mb-4"><div class="card-body">
+<h2 class="card-title h4">Check</h2>
+<button id="checkBtn" class="btn btn-success" onclick="startCheck()">Check fleet now</button>
+<button id="csvBtn" class="btn btn-outline-secondary" onclick="dl('csv')" disabled>Download CSV report</button>
+<button id="htmlBtn" class="btn btn-outline-secondary" onclick="dl('html')" disabled>Download HTML report</button>
+<div id="bar" class="progress mt-3"><div class="progress-bar" role="progressbar" style="width:0%"></div></div>
+<div id="summary" class="mt-2"></div>
+<div class="form-check mt-2"><input class="form-check-input" type="checkbox" id="failOnly" onchange="renderTable()"><label class="form-check-label" for="failOnly">Show failures only</label></div>
+<table id="tbl" class="table table-striped table-hover" hidden><thead class="table-light"><tr><th onclick="sortBy(0)" title="Sort">Name<span id="arr0"></span></th><th onclick="sortBy(1)" title="Sort">Status<span id="arr1"></span></th><th onclick="sortBy(2)" title="Sort">Snapshots<span id="arr2"></span></th><th onclick="sortBy(3)" title="Sort">Latest<span id="arr3"></span></th><th onclick="sortBy(4)" title="Sort">Size<span id="arr4"></span></th></tr></thead></table>
 <script>
-let jobId=null,timer=null;
+let jobId=null,timer=null,staleHrs=24,lastResults=[],sortCol=-1,sortDir=1;
+function sortBy(n){if(sortCol===n){sortDir=-sortDir;}else{sortCol=n;sortDir=1;}renderTable();}
+function cmpRows(a,b,c){
+if(c===2)return (a.snapshots||0)-(b.snapshots||0);
+if(c===3)return String(a.latest||'').localeCompare(String(b.latest||''));
+if(c===4)return ((typeof a.sizeBytes==='number')?a.sizeBytes:-1)-((typeof b.sizeBytes==='number')?b.sizeBytes:-1);
+if(c===1)return String(a.status||'').localeCompare(String(b.status||''));
+return String(a.name||'').localeCompare(String(b.name||''));}
+function renderTable(){
+const tbl=document.getElementById('tbl');while(tbl.rows.length>1)tbl.deleteRow(1);
+let rows=lastResults.slice();
+if(document.getElementById('failOnly').checked)rows=rows.filter(r=>r.status!=='OK');
+if(sortCol>=0)rows.sort((a,b)=>cmpRows(a,b,sortCol)*sortDir);
+for(const r of rows){const tr=tbl.insertRow();tr.insertCell().textContent=r.name;
+const st=tr.insertCell();st.textContent=r.status;st.className=r.status==='OK'?'ok':'fail';
+tr.insertCell().textContent=r.snapshots;const lt=tr.insertCell();lt.textContent=r.latest;
+const t=r.latest?Date.parse(r.latest):NaN;
+if(!isNaN(t)&&Date.now()-t>staleHrs*3600e3){lt.className='text-danger fw-bold';lt.title='Stale: no snapshot within '+staleHrs+'h';}
+tr.insertCell().textContent=r.size;}
+for(let i=0;i<5;i++){const s=document.getElementById('arr'+i);if(s)s.textContent=(i===sortCol?(sortDir>0?' ▲':' ▼'):'');}}
+function fmtBytes(n){if(n>=1099511627776)return (n/1099511627776).toFixed(2)+' TB';if(n>=1073741824)return (n/1073741824).toFixed(2)+' GB';if(n>=1048576)return (n/1048576).toFixed(1)+' MB';if(n>=1024)return (n/1024).toFixed(1)+' KB';return n+' B';}
 async function api(m,p,b){const r=await fetch(p,{method:m,headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined});if(!r.ok)throw new Error(await r.text());return r.json();}
 async function load(){const e=await api('GET','/api/env');const c=await api('GET','/api/config');
 document.getElementById('endpoint').value=c.endpoint;document.getElementById('bucket').value=c.bucket;
 document.getElementById('hosts').value=(c.hostnames||[]).join('\\n');
+staleHrs=parseInt(c.stale_hours)||24;document.getElementById('staleHours').value=staleHrs;
 let w=[];if(!e.AWS_ACCESS_KEY_ID)w.push('AWS_ACCESS_KEY_ID not set');if(!e.AWS_SECRET_ACCESS_KEY)w.push('AWS_SECRET_ACCESS_KEY not set');
 if(!e.RESTIC_PASSWORD_FILE)w.push('RESTIC_PASSWORD_FILE not set');if(!e.restic)w.push('restic not found in PATH');
-document.getElementById('env').innerHTML=w.length?'<div class="warn">Server env missing: '+w.join(', ')+'</div>':'';}
-async function save(){await api('POST','/api/config',{endpoint:document.getElementById('endpoint').value.trim(),bucket:document.getElementById('bucket').value.trim(),hostnames:document.getElementById('hosts').value.split('\\n').map(s=>s.trim()).filter(Boolean)});
+document.getElementById('env').innerHTML=w.length?'<div class="alert alert-warning" role="alert">Server env missing: '+w.join(', ')+'</div>':'';}
+async function save(){staleHrs=Math.min(720,Math.max(1,parseInt(document.getElementById('staleHours').value)||24));
+await api('POST','/api/config',{endpoint:document.getElementById('endpoint').value.trim(),bucket:document.getElementById('bucket').value.trim(),hostnames:document.getElementById('hosts').value.split('\\n').map(s=>s.trim()).filter(Boolean),stale_hours:staleHrs});
 document.getElementById('saved').textContent='Saved.';setTimeout(()=>document.getElementById('saved').textContent='',2000);}
-async function discover(){try{const d=await api('POST','/api/discover');document.getElementById('hosts').value=d.hostnames.join('\\n');}catch(e){alert('Discover failed: '+e.message);}}
+async function discover(){const b=document.getElementById('discBtn');const orig=b.innerHTML;
+b.disabled=true;b.innerHTML='<span class="spinner-border spinner-border-sm" role="status"></span> Discovering…';
+try{const d=await api('POST','/api/discover');document.getElementById('hosts').value=d.hostnames.join('\\n');}
+catch(e){alert('Discover failed: '+e.message);}
+finally{b.disabled=false;b.innerHTML=orig;}}
 function hosts(){return document.getElementById('hosts').value.split('\\n').map(s=>s.trim()).filter(Boolean);}
 async function startCheck(){const h=hosts();if(!h.length){alert('Enter at least one hostname.');return;}
 document.getElementById('checkBtn').disabled=true;document.getElementById('csvBtn').disabled=true;document.getElementById('htmlBtn').disabled=true;
 const tbl=document.getElementById('tbl');tbl.hidden=false;while(tbl.rows.length>1)tbl.deleteRow(1);
-document.getElementById('summary').textContent='';
+document.getElementById('summary').className='mt-2';
 const j=await api('POST','/api/check',{hosts:h});jobId=j.jobId;timer=setInterval(poll,2000);poll();}
 async function poll(){const j=await api('GET','/api/job?jobId='+encodeURIComponent(jobId));
 document.querySelector('#bar>div').style.width=Math.round(j.completed/j.total*100)+'%';
-const tbl=document.getElementById('tbl');while(tbl.rows.length>1)tbl.deleteRow(1);
-for(const r of j.results){const tr=tbl.insertRow();tr.insertCell().textContent=r.name;
-const st=tr.insertCell();st.textContent=r.status;st.className=r.status==='OK'?'ok':'fail';
-tr.insertCell().textContent=r.snapshots;tr.insertCell().textContent=r.latest;tr.insertCell().textContent=r.size;}
+lastResults=j.results;renderTable();
 if(j.done){clearInterval(timer);document.getElementById('checkBtn').disabled=false;
 const ok=j.results.filter(r=>r.status==='OK').length;
-document.getElementById('summary').textContent=`Checked ${j.results.length}: ${ok} OK, ${j.results.length-ok} FAIL.`;
+document.getElementById('summary').className='alert alert-info mt-2';
+const known=j.results.filter(r=>typeof r.sizeBytes==='number');
+const tot=known.reduce((a,r)=>a+r.sizeBytes,0);
+document.getElementById('summary').textContent=`Checked ${j.results.length}: ${ok} OK, ${j.results.length-ok} FAIL.`+(known.length?` Total size used: ${fmtBytes(tot)} (across ${known.length} of ${j.results.length}).`:'');
 document.getElementById('csvBtn').disabled=false;document.getElementById('htmlBtn').disabled=false;}}
 function dl(kind){window.location='/api/report.'+kind+'?jobId='+encodeURIComponent(jobId);}
 load();
-</script></body></html>"""
+</script></div></body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -362,6 +456,9 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(data.get("hostnames"), list):
                 cfg["hostnames"] = sorted({str(h).strip() for h in data["hostnames"]
                                            if str(h).strip()})
+            sh = data.get("stale_hours")
+            if isinstance(sh, (int, float)) and 1 <= sh <= 720:
+                cfg["stale_hours"] = int(sh)
             save_config(cfg)
             return self._json({"saved": True})
         if url.path == "/api/discover":
