@@ -104,6 +104,11 @@ powershell -File .\check-fleet.ps1
 # Browser dashboard instead of CLI (Python 3.8+, no pip packages; restic on PATH)
 python fleet-dashboard.py
 # open http://127.0.0.1:8080 -> enter hostnames (or Discover), Check fleet now, download CSV/HTML
+# Click a column header to sort (again to reverse); "Show failures only" filters.
+# Click a laptop name to expand its 10 most recent snapshots. Latest cells older
+# than the Stale threshold (Settings, default 24h) highlight red.
+# Growth card tracks total fleet size over time (logged per check on the IT
+# machine only — no Wasabi/laptop changes); needs a few weeks of checks to fill in.
 python fleet-dashboard.py --port 8080
 ```
 

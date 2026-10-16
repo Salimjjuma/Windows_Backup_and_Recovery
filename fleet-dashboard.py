@@ -30,7 +30,7 @@ import subprocess
 import threading
 import urllib.parse
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -159,6 +159,91 @@ def discover(endpoint, bucket):
         raise RuntimeError(f"bucket listing failed: {out[:500]}")
     prefixes = json.loads(out or "[]") or []
     return sorted(p.rstrip("/") for p in prefixes if p and p.rstrip("/"))
+
+
+HISTORY_FILE = os.path.join(BASE_DIR, "fleet-history.jsonl")
+HISTORY_LOCK = threading.Lock()
+HISTORY_KEEP_DAYS = 365
+
+
+def log_history(results):
+    """Append one entry per completed check. Tiny local file, no S3 calls."""
+    entry = {"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "results": [{"name": r.get("name", ""),
+                          "status": r.get("status", ""),
+                          "snapshots": r.get("snapshots", 0),
+                          "sizeBytes": r.get("sizeBytes")}
+                         for r in results]}
+    with HISTORY_LOCK:
+        try:
+            with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError:
+            return
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            return
+        if len(lines) > 2000:
+            cutoff = (datetime.now(timezone.utc)
+                      - timedelta(days=HISTORY_KEEP_DAYS))
+            kept = []
+            for ln in lines:
+                try:
+                    dt = datetime.strptime(json.loads(ln).get("ts", ""),
+                                           "%Y-%m-%dT%H:%M:%SZ").replace(
+                                               tzinfo=timezone.utc)
+                except (ValueError, AttributeError):
+                    continue
+                if dt >= cutoff:
+                    kept.append(ln)
+            if len(kept) < len(lines):
+                try:
+                    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+                        f.writelines(kept)
+                except OSError:
+                    pass
+
+
+def read_history(days=84):
+    """Daily rollup: fleet total + per-host series. Last entry wins per day."""
+    try:
+        days = max(7, min(int(days), 365))
+    except (TypeError, ValueError):
+        days = 84
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    per_day = {}
+    with HISTORY_LOCK:
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except (FileNotFoundError, OSError):
+            return {"total": [], "hosts": {}}
+    for ln in lines:
+        try:
+            entry = json.loads(ln)
+            dt = datetime.strptime(entry.get("ts", ""),
+                                   "%Y-%m-%dT%H:%M:%SZ").replace(
+                                       tzinfo=timezone.utc)
+        except (ValueError, AttributeError):
+            continue
+        if dt < cutoff:
+            continue
+        day = entry["ts"][:10]
+        d = per_day.setdefault(day, {})
+        for r in entry.get("results") or []:
+            if isinstance(r.get("sizeBytes"), int):
+                d[r.get("name", "")] = r["sizeBytes"]
+    ordered = sorted(per_day.items())
+    names = sorted({n for _, d in ordered for n in d})
+    return {
+        "total": [{"date": day, "bytes": sum(d.values()), "known": len(d)}
+                  for day, d in ordered],
+        "hosts": {name: [{"date": day, "bytes": d[name]}
+                         for day, d in ordered if name in d]
+                  for name in names},
+    }
 
 
 # ---------------------------------------------------------------- reports
@@ -303,8 +388,37 @@ label.form-label{display:block}
 <div id="summary" class="mt-2"></div>
 <div class="form-check mt-2"><input class="form-check-input" type="checkbox" id="failOnly" onchange="renderTable()"><label class="form-check-label" for="failOnly">Show failures only</label></div>
 <table id="tbl" class="table table-striped table-hover" hidden><thead class="table-light"><tr><th onclick="sortBy(0)" title="Sort">Name<span id="arr0"></span></th><th onclick="sortBy(1)" title="Sort">Status<span id="arr1"></span></th><th onclick="sortBy(2)" title="Sort">Snapshots<span id="arr2"></span></th><th onclick="sortBy(3)" title="Sort">Latest<span id="arr3"></span></th><th onclick="sortBy(4)" title="Sort">Size<span id="arr4"></span></th></tr></thead></table>
+</div></div>
+<div class="card mb-4"><div class="card-body">
+<h2 class="card-title h4">Growth</h2>
+<div class="row g-3"><div class="col-md-4"><label class="form-label">Window<select class="form-select" id="histDays" onchange="loadHistory()"><option value="28">Last 4 weeks</option><option value="84" selected>Last 12 weeks</option><option value="365">Last year</option></select></label></div>
+<div class="col-md-4"><label class="form-label">Laptop overlay<select class="form-select" id="histHost" onchange="renderHistory()"><option value="">Fleet total only</option></select></label></div></div>
+<div id="histStatus" class="text-muted mt-2"></div>
+<div id="histChart" class="mt-2"></div>
+</div></div>
 <script>
 let jobId=null,timer=null,staleHrs=24,lastResults=[],sortCol=-1,sortDir=1;
+let expanded={},snapCache={},snapLoading={};
+let histData=null;
+function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function snapKey(name){return 'snaps-'+String(name).replace(/[^A-Za-z0-9_-]/g,'_');}
+function toggleSnaps(name){if(expanded[name]){delete expanded[name];}else{expanded[name]=true;}renderTable();}
+function detailRow(tbl,r){
+const dr=tbl.insertRow();dr.className='table-active';
+const td=dr.insertCell();td.colSpan=5;
+const key=snapKey(r.name);
+if(snapCache[r.name]){td.innerHTML=snapCache[r.name];return;}
+td.innerHTML='<div id="'+key+'"><span class="spinner-border spinner-border-sm" role="status"></span> Loading snapshots…</div>';
+if(snapLoading[r.name])return;
+snapLoading[r.name]=true;
+api('POST','/api/snapshots',{host:r.name,limit:10}).then(d=>{
+let htm;
+if(!d.snapshots||!d.snapshots.length){htm='<span class="text-muted">No snapshots.</span>';}
+else{htm='<table class="table table-sm mb-0"><thead><tr><th>Time</th><th>ID</th><th>Paths</th></tr></thead><tbody>'+
+d.snapshots.map(s=>'<tr><td>'+escapeHtml(s.time||'')+'</td><td><code>'+escapeHtml(s.short_id||s.id||'')+'</code></td><td>'+escapeHtml((s.paths||[]).join(', '))+'</td></tr>').join('')+'</tbody></table>';}
+snapCache[r.name]=htm;const tgt=document.getElementById(key);if(tgt)tgt.innerHTML=htm;
+}).catch(()=>{const tgt=document.getElementById(key);if(tgt)tgt.innerHTML='<span class="text-danger">Failed to load snapshots.</span>';
+}).finally(()=>{snapLoading[r.name]=false;});}
 function sortBy(n){if(sortCol===n){sortDir=-sortDir;}else{sortCol=n;sortDir=1;}renderTable();}
 function cmpRows(a,b,c){
 if(c===2)return (a.snapshots||0)-(b.snapshots||0);
@@ -317,14 +431,54 @@ const tbl=document.getElementById('tbl');while(tbl.rows.length>1)tbl.deleteRow(1
 let rows=lastResults.slice();
 if(document.getElementById('failOnly').checked)rows=rows.filter(r=>r.status!=='OK');
 if(sortCol>=0)rows.sort((a,b)=>cmpRows(a,b,sortCol)*sortDir);
-for(const r of rows){const tr=tbl.insertRow();tr.insertCell().textContent=r.name;
+for(const r of rows){const tr=tbl.insertRow();
+const nm=tr.insertCell();const lk=document.createElement('a');lk.href='#';lk.textContent=r.name;
+lk.onclick=(function(n){return function(e){e.preventDefault();toggleSnaps(n);};})(r.name);
+nm.appendChild(lk);nm.style.cursor='pointer';nm.title='Click to expand snapshots';
 const st=tr.insertCell();st.textContent=r.status;st.className=r.status==='OK'?'ok':'fail';
 tr.insertCell().textContent=r.snapshots;const lt=tr.insertCell();lt.textContent=r.latest;
 const t=r.latest?Date.parse(r.latest):NaN;
 if(!isNaN(t)&&Date.now()-t>staleHrs*3600e3){lt.className='text-danger fw-bold';lt.title='Stale: no snapshot within '+staleHrs+'h';}
-tr.insertCell().textContent=r.size;}
+tr.insertCell().textContent=r.size;
+if(expanded[r.name])detailRow(tbl,r);}
 for(let i=0;i<5;i++){const s=document.getElementById('arr'+i);if(s)s.textContent=(i===sortCol?(sortDir>0?' ▲':' ▼'):'');}}
 function fmtBytes(n){if(n>=1099511627776)return (n/1099511627776).toFixed(2)+' TB';if(n>=1073741824)return (n/1073741824).toFixed(2)+' GB';if(n>=1048576)return (n/1048576).toFixed(1)+' MB';if(n>=1024)return (n/1024).toFixed(1)+' KB';return n+' B';}
+async function loadHistory(){const d=document.getElementById('histDays').value;
+let h;try{h=await api('GET','/api/history?days='+encodeURIComponent(d));}
+catch(e){document.getElementById('histStatus').textContent='Could not load history.';return;}
+histData=h;
+const sel=document.getElementById('histHost');const cur=sel.value;
+sel.innerHTML='<option value="">Fleet total only</option>'+Object.keys(h.hosts||{}).sort().map(n=>'<option>'+escapeHtml(n)+'</option>').join('');
+if(cur&&h.hosts[cur])sel.value=cur;
+renderHistory();}
+function renderHistory(){
+const box=document.getElementById('histChart');const st=document.getElementById('histStatus');
+if(!histData||!histData.total||!histData.total.length){box.innerHTML='';st.textContent='No history yet — run checks regularly and this chart will fill in.';return;}
+const pts=histData.total;const host=document.getElementById('histHost').value;
+const W=640,H=220,P=40;
+const hv=(host&&histData.hosts[host])||[];
+const max=Math.max.apply(null,pts.map(p=>p.bytes).concat(hv.map(p=>p.bytes),[1]));
+const X=i=>pts.length<2?P+(W-2*P)/2:P+i*(W-2*P)/(pts.length-1);
+const Y=v=>H-P-(v/max)*(H-2*P);
+const idx={};pts.forEach((p,i)=>idx[p.date]=i);
+let svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto" role="img">';
+svg+='<line x1="'+P+'" y1="'+(H-P)+'" x2="'+(W-8)+'" y2="'+(H-P)+'" stroke="#ccc"/>';
+svg+='<text x="4" y="'+(Y(max)+4).toFixed(1)+'" font-size="10">'+escapeHtml(fmtBytes(max))+'</text>';
+svg+='<text x="4" y="'+(H-P)+'" font-size="10">0</text>';
+svg+='<text x="'+P+'" y="'+(H-8)+'" font-size="10">'+escapeHtml(pts[0].date)+'</text>';
+svg+='<text x="'+(W-8)+'" y="'+(H-8)+'" font-size="10" text-anchor="end">'+escapeHtml(pts[pts.length-1].date)+'</text>';
+svg+='<polyline fill="none" stroke="#0d6efd" stroke-width="2" points="'+pts.map((p,i)=>X(i).toFixed(1)+','+Y(p.bytes).toFixed(1)).join(' ')+'"/>';
+svg+=pts.map((p,i)=>'<circle cx="'+X(i).toFixed(1)+'" cy="'+Y(p.bytes).toFixed(1)+'" r="3" fill="#0d6efd"><title>'+escapeHtml(p.date+': '+fmtBytes(p.bytes))+'</title></circle>').join('');
+if(host&&hv.length){svg+='<polyline fill="none" stroke="#fd7e14" stroke-width="2" stroke-dasharray="5,3" points="'+hv.filter(p=>p.date in idx).map(p=>X(idx[p.date]).toFixed(1)+','+Y(p.bytes).toFixed(1)).join(' ')+'"/>';}
+svg+='</svg>';
+svg+='<div><span style="display:inline-block;width:12px;height:12px;background:#0d6efd"></span> Fleet total'+(host?' &nbsp; <span style="display:inline-block;width:12px;height:12px;background:#fd7e14"></span> '+escapeHtml(host):'')+'</div>';
+box.innerHTML=svg;
+if(pts.length<2){st.textContent='Only 1 day of history so far — the growth rate appears once a second day is logged.';return;}
+const first=pts[0],last=pts[pts.length-1];
+const weeks=Math.max((Date.parse(last.date)-Date.parse(first.date))/6048e5,1/7);
+const rate=(last.bytes-first.bytes)/weeks;
+const per=fmtBytes(Math.abs(Math.round(rate)));
+st.textContent=(rate>0?'Growing ≈ '+per:rate<0?'Shrinking ≈ '+per:'Flat')+'/week over '+pts.length+' day(s) of history.';}
 async function api(m,p,b){const r=await fetch(p,{method:m,headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined});if(!r.ok)throw new Error(await r.text());return r.json();}
 async function load(){const e=await api('GET','/api/env');const c=await api('GET','/api/config');
 document.getElementById('endpoint').value=c.endpoint;document.getElementById('bucket').value=c.bucket;
@@ -346,6 +500,7 @@ async function startCheck(){const h=hosts();if(!h.length){alert('Enter at least 
 document.getElementById('checkBtn').disabled=true;document.getElementById('csvBtn').disabled=true;document.getElementById('htmlBtn').disabled=true;
 const tbl=document.getElementById('tbl');tbl.hidden=false;while(tbl.rows.length>1)tbl.deleteRow(1);
 document.getElementById('summary').className='mt-2';
+expanded={};snapCache={};snapLoading={};
 const j=await api('POST','/api/check',{hosts:h});jobId=j.jobId;timer=setInterval(poll,2000);poll();}
 async function poll(){const j=await api('GET','/api/job?jobId='+encodeURIComponent(jobId));
 document.querySelector('#bar>div').style.width=Math.round(j.completed/j.total*100)+'%';
@@ -356,9 +511,9 @@ document.getElementById('summary').className='alert alert-info mt-2';
 const known=j.results.filter(r=>typeof r.sizeBytes==='number');
 const tot=known.reduce((a,r)=>a+r.sizeBytes,0);
 document.getElementById('summary').textContent=`Checked ${j.results.length}: ${ok} OK, ${j.results.length-ok} FAIL.`+(known.length?` Total size used: ${fmtBytes(tot)} (across ${known.length} of ${j.results.length}).`:'');
-document.getElementById('csvBtn').disabled=false;document.getElementById('htmlBtn').disabled=false;}}
+document.getElementById('csvBtn').disabled=false;document.getElementById('htmlBtn').disabled=false;loadHistory();}}
 function dl(kind){window.location='/api/report.'+kind+'?jobId='+encodeURIComponent(jobId);}
-load();
+load();loadHistory();
 </script></div></body></html>"""
 
 
@@ -428,6 +583,9 @@ class Handler(BaseHTTPRequestHandler):
                                    "completed": job["completed"],
                                    "results": list(job["results"]),
                                    "error": job["error"]})
+        if url.path == "/api/history":
+            q = urllib.parse.parse_qs(url.query)
+            return self._json(read_history((q.get("days") or ["84"])[0]))
         if url.path in ("/api/report.csv", "/api/report.html"):
             q = urllib.parse.parse_qs(url.query)
             with JOBS_LOCK:
@@ -489,6 +647,39 @@ class Handler(BaseHTTPRequestHandler):
                                  daemon=True)
             t.start()
             return self._json({"jobId": job_id})
+        if url.path == "/api/snapshots":
+            data = self._body_json()
+            host = str(data.get("host") or "").strip()
+            if not host:
+                return self._json({"error": "no host given"}, 400)
+            if not shutil.which("restic"):
+                return self._json({"error": "restic not found on server"}, 500)
+            try:
+                limit = int(data.get("limit") or 10)
+            except (TypeError, ValueError):
+                limit = 10
+            limit = max(1, min(limit, 50))
+            cfg = load_config()
+            repo = f"s3:{cfg['endpoint']}/{cfg['bucket']}/{host}"
+            code, out = run_cmd(["restic", "snapshots", "--json"],
+                                {"RESTIC_REPOSITORY": repo})
+            if code != 0:
+                return self._json({"error": "could not list snapshots"}, 500)
+            try:
+                snaps = json.loads(out or "[]")
+                if isinstance(snaps, dict):
+                    snaps = [snaps]
+            except json.JSONDecodeError:
+                return self._json({"error": "snapshot output was not valid JSON"}, 500)
+            snaps = sorted((s for s in snaps if isinstance(s, dict)),
+                           key=lambda s: s.get("time", ""),
+                           reverse=True)[:limit]
+            return self._json({"host": host, "snapshots": [
+                {"id": str(s.get("id", "")),
+                 "short_id": str(s.get("short_id", "")
+                                 or str(s.get("id", ""))[:8]),
+                 "time": s.get("time", ""),
+                 "paths": s.get("paths", [])} for s in snaps]})
         return self._text("not found", "text/plain", code=404)
 
 
@@ -514,6 +705,9 @@ def _run_job(job, hosts, endpoint, bucket):
     finally:
         with job["lock"]:
             job["done"] = True
+            done_results = list(job["results"])
+        if done_results:
+            log_history(done_results)
 
 
 def main():
