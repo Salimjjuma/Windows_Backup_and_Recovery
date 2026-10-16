@@ -185,12 +185,12 @@ def report_html(results, endpoint, bucket):
         for r in results)
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
-<title>Fleet backup report - {html.escape(stamp)}</title>
+<title>Mewa Backup and Restore - SP ICT-1 2026-2030 - {html.escape(stamp)}</title>
 <style>body{{font-family:sans-serif;margin:2em}}table{{border-collapse:collapse;width:100%}}
 th,td{{border:1px solid #ccc;padding:6px 10px;text-align:left}}th{{background:#f0f0f0}}
 .ok{{color:green;font-weight:bold}}.fail{{color:red;font-weight:bold}}</style>
 </head><body>
-<h1>Fleet backup report</h1>
+<h1>Mewa Backup and Restore - SP ICT-1 2026-2030</h1>
 <p>Generated {html.escape(stamp)} - bucket <code>{html.escape(bucket)}</code>
 via <code>{html.escape(endpoint)}</code></p>
 <p><strong>{ok} OK, {len(results) - ok} FAIL</strong> out of {len(results)} checked.</p>
@@ -204,9 +204,11 @@ via <code>{html.escape(endpoint)}</code></p>
 
 PAGE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Fleet Backup Dashboard</title>
+<title>Mewa Backup and Restore - SP ICT-1 2026-2030</title>
 <style>
 body{font-family:sans-serif;margin:2em;max-width:1000px}
+.brand{display:flex;align-items:center;gap:14px}
+.brand img{height:56px;width:auto}
 textarea{width:100%;height:120px;font-family:monospace}
 input[type=text]{width:100%;box-sizing:border-box}
 .ok{color:green;font-weight:bold}.fail{color:red;font-weight:bold}
@@ -217,7 +219,7 @@ th,td{border:1px solid #ccc;padding:6px 10px;text-align:left}th{background:#f0f0
 button{margin:4px 4px 4px 0;padding:6px 12px}
 .row{display:flex;gap:12px}.row>div{flex:1}
 </style></head><body>
-<h1>Fleet Backup Dashboard</h1>
+<div class="brand"><img src="/assets/logo.jpeg" alt="Mewa logo"><h1>Mewa Backup and Restore - SP ICT-1 2026-2030</h1></div>
 <div id="env"></div>
 <h2>Settings</h2>
 <div class="row"><div><label>Wasabi endpoint<br><input type="text" id="endpoint"></label></div>
@@ -291,6 +293,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _bytes(self, raw, ctype, code=200):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
     def _body_json(self):
         try:
             n = int(self.headers.get("Content-Length") or 0)
@@ -304,6 +313,12 @@ class Handler(BaseHTTPRequestHandler):
         url = urllib.parse.urlparse(self.path)
         if url.path == "/":
             return self._text(PAGE, "text/html; charset=utf-8")
+        if url.path == "/assets/logo.jpeg":
+            logo = os.path.join(BASE_DIR, "assets", "logo.jpeg")
+            if not os.path.isfile(logo):
+                return self._text("logo not found", "text/plain", code=404)
+            with open(logo, "rb") as f:
+                return self._bytes(f.read(), "image/jpeg")
         if url.path == "/api/env":
             return self._json(env_status())
         if url.path == "/api/config":
