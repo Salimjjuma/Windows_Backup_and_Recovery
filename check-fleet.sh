@@ -214,15 +214,20 @@ SAVED_REPO="${RESTIC_REPOSITORY:-}"
 results=()   # name|status|snapshots|latest|size
 fail_count=0
 i=0
+# Per-host stderr capture file: keeps restic's warnings off stdout so they
+# can't contaminate the JSON parsed below (a mixed-in warning line would
+# report a false "FAIL parse"), and lets failures show the real reason.
+_errfile="$(mktemp)"
+trap 'rm -f "$_errfile"' EXIT
 for host in "${HOSTNAMES[@]}"; do
     i=$((i + 1))
     echo "[$i/${#HOSTNAMES[@]}] $host..." >&2
     export RESTIC_REPOSITORY="s3:$ENDPOINT/$BUCKET/$host"
 
-    snap_json="$(restic snapshots --json 2>&1)" || {
+    snap_json="$(restic snapshots --json 2>"$_errfile")" || {
         results+=("$host|FAIL snapshots|0||")
         fail_count=$((fail_count + 1))
-        echo "WARNING: $host: could not list snapshots." >&2
+        echo "WARNING: $host: could not list snapshots: $(tail -c 500 "$_errfile" | tr '\n' ' ')" >&2
         continue
     }
     parsed="$(printf '%s' "$snap_json" | python3 -c "
@@ -246,7 +251,8 @@ print(times[-1] if times else '')
     latest="$(printf '%s' "$parsed" | sed -n '2p')"
 
     size="unknown"
-    stats_json="$(restic stats --mode raw-data --json 2>&1)" && {
+    # stderr to file, same reason as the snapshots call above
+    stats_json="$(restic stats --mode raw-data --json 2>"$_errfile")" && {
         total="$(printf '%s' "$stats_json" | python3 -c "
 import json,sys
 try:
