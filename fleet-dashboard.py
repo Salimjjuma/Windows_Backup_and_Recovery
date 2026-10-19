@@ -82,6 +82,8 @@ def env_status():
 # ---------------------------------------------------------------- restic
 
 def run_cmd(args, extra_env=None, timeout=PER_HOST_TIMEOUT):
+    """Run a tool; return (returncode, stdout, stderr). stderr is kept so
+    restic/aws failures can show their real reason instead of just 'FAIL'."""
     env = dict(os.environ)
     if extra_env:
         env.update(extra_env)
@@ -89,11 +91,17 @@ def run_cmd(args, extra_env=None, timeout=PER_HOST_TIMEOUT):
         p = subprocess.run(
             args, capture_output=True, text=True, timeout=timeout, env=env
         )
-        return p.returncode, (p.stdout or "").strip()
+        return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
     except FileNotFoundError:
-        return 127, ""
+        return 127, "", ""
     except subprocess.TimeoutExpired:
-        return 124, ""
+        return 124, "", "timed out"
+
+
+def err_tail(err, limit=200):
+    """Last non-empty stderr line, trimmed - the tools put the real reason last."""
+    lines = [ln.strip() for ln in (err or "").splitlines() if ln.strip()]
+    return (lines[-1] if lines else "")[:limit]
 
 
 def format_bytes(n):
@@ -114,12 +122,13 @@ def check_one(hostname, endpoint, bucket):
     """Mirror of check-fleet.ps1 per-laptop logic. Returns a row dict."""
     repo = f"s3:{endpoint}/{bucket}/{hostname}"
     row = {"name": hostname, "status": "", "snapshots": 0,
-           "latest": "", "size": "", "sizeBytes": None}
+           "latest": "", "size": "", "sizeBytes": None, "detail": ""}
 
-    code, out = run_cmd(["restic", "snapshots", "--json"],
-                        {"RESTIC_REPOSITORY": repo})
+    code, out, err = run_cmd(["restic", "snapshots", "--json"],
+                             {"RESTIC_REPOSITORY": repo})
     if code != 0:
         row["status"] = "FAIL snapshots"
+        row["detail"] = err_tail(err) or f"restic exited with code {code}"
         return row
     try:
         snaps = json.loads(out or "[]")
@@ -127,14 +136,15 @@ def check_one(hostname, endpoint, bucket):
             snaps = [snaps]
     except json.JSONDecodeError:
         row["status"] = "FAIL parse"
+        row["detail"] = "snapshot output was not valid JSON"
         return row
     row["snapshots"] = len(snaps)
     if snaps:
         times = sorted(s.get("time", "") for s in snaps if isinstance(s, dict))
         row["latest"] = times[-1] if times else ""
 
-    code, out = run_cmd(["restic", "stats", "--mode", "raw-data", "--json"],
-                        {"RESTIC_REPOSITORY": repo})
+    code, out, _ = run_cmd(["restic", "stats", "--mode", "raw-data", "--json"],
+                           {"RESTIC_REPOSITORY": repo})
     if code == 0:
         try:
             total = json.loads(out or "{}").get("total_size")
@@ -150,13 +160,14 @@ def check_one(hostname, endpoint, bucket):
 
 
 def discover(endpoint, bucket):
-    code, out = run_cmd(["aws", "s3api", "list-objects-v2",
-                         "--bucket", bucket, "--delimiter", "/",
-                         "--endpoint-url", endpoint,
-                         "--query", "CommonPrefixes[].Prefix",
-                         "--output", "json"])
+    code, out, err = run_cmd(["aws", "s3api", "list-objects-v2",
+                              "--bucket", bucket, "--delimiter", "/",
+                              "--endpoint-url", endpoint,
+                              "--query", "CommonPrefixes[].Prefix",
+                              "--output", "json"])
     if code != 0:
-        raise RuntimeError(f"bucket listing failed: {out[:500]}")
+        raise RuntimeError(
+            f"bucket listing failed: {err_tail(err, 500) or f'aws exited with code {code}'}")
     prefixes = json.loads(out or "[]") or []
     return sorted(p.rstrip("/") for p in prefixes if p and p.rstrip("/"))
 
@@ -251,12 +262,13 @@ def read_history(days=84):
 def report_csv(results):
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["Name", "Status", "Snapshots", "Latest", "Size", "SizeBytes"])
+    w.writerow(["Name", "Status", "Snapshots", "Latest", "Size", "SizeBytes", "Detail"])
     for r in results:
         w.writerow([r.get("name", ""), r.get("status", ""),
                     r.get("snapshots", 0), r.get("latest", ""),
                     r.get("size", ""),
-                    r.get("sizeBytes") if r.get("sizeBytes") is not None else ""])
+                    r.get("sizeBytes") if r.get("sizeBytes") is not None else "",
+                    r.get("detail", "")])
     return buf.getvalue()
 
 
@@ -435,7 +447,7 @@ for(const r of rows){const tr=tbl.insertRow();
 const nm=tr.insertCell();const lk=document.createElement('a');lk.href='#';lk.textContent=r.name;
 lk.onclick=(function(n){return function(e){e.preventDefault();toggleSnaps(n);};})(r.name);
 nm.appendChild(lk);nm.style.cursor='pointer';nm.title='Click to expand snapshots';
-const st=tr.insertCell();st.textContent=r.status;st.className=r.status==='OK'?'ok':'fail';
+const st=tr.insertCell();st.textContent=r.status;st.className=r.status==='OK'?'ok':'fail';if(r.detail){st.title=r.detail;st.style.cursor='help';}
 tr.insertCell().textContent=r.snapshots;const lt=tr.insertCell();lt.textContent=r.latest;
 const t=r.latest?Date.parse(r.latest):NaN;
 if(!isNaN(t)&&Date.now()-t>staleHrs*3600e3){lt.className='text-danger fw-bold';lt.title='Stale: no snapshot within '+staleHrs+'h';}
@@ -507,10 +519,10 @@ document.querySelector('#bar>div').style.width=Math.round(j.completed/j.total*10
 lastResults=j.results;renderTable();
 if(j.done){clearInterval(timer);document.getElementById('checkBtn').disabled=false;
 const ok=j.results.filter(r=>r.status==='OK').length;
-document.getElementById('summary').className='alert alert-info mt-2';
+document.getElementById('summary').className=(j.error&&!j.results.length)?'alert alert-danger mt-2':'alert alert-info mt-2';
 const known=j.results.filter(r=>typeof r.sizeBytes==='number');
 const tot=known.reduce((a,r)=>a+r.sizeBytes,0);
-document.getElementById('summary').textContent=`Checked ${j.results.length}: ${ok} OK, ${j.results.length-ok} FAIL.`+(known.length?` Total size used: ${fmtBytes(tot)} (across ${known.length} of ${j.results.length}).`:'');
+document.getElementById('summary').textContent=`Checked ${j.results.length}: ${ok} OK, ${j.results.length-ok} FAIL.`+(known.length?` Total size used: ${fmtBytes(tot)} (across ${known.length} of ${j.results.length}).`:'')+(j.error?` Job error: ${j.error}`:'');
 document.getElementById('csvBtn').disabled=false;document.getElementById('htmlBtn').disabled=false;loadHistory();}}
 function dl(kind){window.location='/api/report.'+kind+'?jobId='+encodeURIComponent(jobId);}
 load();loadHistory();
@@ -661,10 +673,13 @@ class Handler(BaseHTTPRequestHandler):
             limit = max(1, min(limit, 50))
             cfg = load_config()
             repo = f"s3:{cfg['endpoint']}/{cfg['bucket']}/{host}"
-            code, out = run_cmd(["restic", "snapshots", "--json"],
-                                {"RESTIC_REPOSITORY": repo})
+            code, out, err = run_cmd(["restic", "snapshots", "--json"],
+                                     {"RESTIC_REPOSITORY": repo})
             if code != 0:
-                return self._json({"error": "could not list snapshots"}, 500)
+                return self._json(
+                    {"error": f"could not list snapshots: "
+                              f"{err_tail(err, 300) or f'restic exited with code {code}'}"},
+                    500)
             try:
                 snaps = json.loads(out or "[]")
                 if isinstance(snaps, dict):
