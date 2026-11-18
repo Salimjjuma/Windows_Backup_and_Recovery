@@ -201,7 +201,8 @@ def check_one(hostname, endpoint, bucket):
     """Mirror of check-fleet.ps1 per-laptop logic. Returns a row dict."""
     repo = f"s3:{endpoint}/{bucket}/{hostname}"
     row = {"name": hostname, "status": "", "snapshots": 0,
-           "latest": "", "size": "", "sizeBytes": None, "detail": ""}
+           "latest": "", "size": "", "sizeBytes": None, "detail": "",
+           "pruneBacklog": None, "pruneOldestDays": None, "prune": "unknown"}
 
     code, out, err = run_cmd(["restic", "snapshots", "--json"],
                              {"RESTIC_REPOSITORY": repo})
