@@ -273,6 +273,24 @@ $sourceScript = Join-Path $PSScriptRoot "sync-documents.ps1"
 Copy-Item -Path $sourceScript -Destination $ScriptDest -Force -ErrorAction Stop
 Write-Host "Watcher script deployed to $ScriptDest"
 
+# Retention policy file: the single source of truth the agent prunes with and
+# the IT fleet tools (check-fleet.ps1/.sh, fleet-dashboard.py) read, so the
+# prune backlog column matches what this laptop actually does. Copied only if
+# absent, so a per-laptop override survives a re-run. If this installer has no
+# retention.json beside it, the agent falls back to the built-in defaults.
+$sourceRetention = Join-Path $PSScriptRoot "retention.json"
+$destRetention   = Join-Path $ConfigDir "retention.json"
+if (Test-Path $sourceRetention) {
+    if (Test-Path $destRetention) {
+        Write-Host "Retention policy already present at $destRetention, leaving as-is."
+    } else {
+        Copy-Item -Path $sourceRetention -Destination $destRetention -Force -ErrorAction Stop
+        Write-Host "Retention policy deployed to $destRetention"
+    }
+} else {
+    Write-Host "No retention.json next to the installer - agent will use built-in defaults (14/8/12)."
+}
+
 # ---- 7. Register Scheduled Task: run at logon, restart on failure ----
 Show-InstallProgress -Step 7 -Status "Registering scheduled task"
 $TaskName = "DocumentsBackupSync"

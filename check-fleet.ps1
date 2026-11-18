@@ -2,8 +2,8 @@
 # check-fleet.ps1
 # Run by IT (not on staff laptops) to check every laptop's restic
 # repository: snapshot count, latest snapshot time, repo size, and prune
-# backlog (snapshots the retention policy kept in sync-documents.ps1
-# would still remove — a sign pruning is behind, e.g. after agent restarts).
+# backlog (snapshots the retention policy — read from retention.json — would
+# still remove: a sign pruning is behind, e.g. after agent restarts).
 #
 # Usage:
 #   powershell -File check-fleet.ps1 -HostNames LAPTOP-1,LAPTOP-2
@@ -38,6 +38,41 @@ foreach ($v in @("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "RESTIC_PASSWORD_
 }
 $resticCmd = Get-Command restic -ErrorAction SilentlyContinue
 if (-not $resticCmd) { throw "restic not found in PATH on this machine." }
+
+# ---- Retention policy (single source of truth: retention.json) ----
+# Shared with sync-documents.ps1 (the agent), check-fleet.sh and
+# fleet-dashboard.py, so the prune backlog column always reflects the policy
+# the laptops actually prune with. Defaults match the old hard-coded values.
+$RetentionFile = if ($PSScriptRoot) {
+    Join-Path $PSScriptRoot "retention.json"
+} else {
+    # e.g. pasted into ISE, where $PSScriptRoot is empty
+    Join-Path (Get-Location).Path "retention.json"
+}
+$KeepDaily = 14; $KeepWeekly = 8; $KeepMonthly = 12
+
+function Read-KeepCount {
+    param($Config, [string]$Name, [int]$Default)
+    if ($null -eq $Config) { return $Default }
+    $raw = $Config.$Name
+    if ($null -eq $raw) { return $Default }
+    $parsed = 0
+    if ([int]::TryParse("$raw", [ref]$parsed) -and $parsed -gt 0) { return $parsed }
+    return $Default
+}
+
+try {
+    if (Test-Path $RetentionFile) {
+        $retentionConfig = Get-Content -Path $RetentionFile -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+        $KeepDaily   = Read-KeepCount -Config $retentionConfig -Name "keepDaily"   -Default $KeepDaily
+        $KeepWeekly  = Read-KeepCount -Config $retentionConfig -Name "keepWeekly"  -Default $KeepWeekly
+        $KeepMonthly = Read-KeepCount -Config $retentionConfig -Name "keepMonthly" -Default $KeepMonthly
+    }
+} catch {
+    Write-Warning "Could not read $RetentionFile - using defaults ($KeepDaily/$KeepWeekly/$KeepMonthly)."
+}
+Write-Host "Retention policy: keep-daily $KeepDaily, keep-weekly $KeepWeekly, keep-monthly $KeepMonthly"
 
 $Bucket = ($BucketAndPrefix -split "/")[0]
 $SavedRepo = $env:RESTIC_REPOSITORY
@@ -77,14 +112,14 @@ function Format-Bytes {
     return "$Bytes B"
 }
 
-# Retention policy mirrors sync-documents.ps1 (restic forget --prune,
-# --keep-daily 14 --keep-weekly 8 --keep-monthly 12). Re-evaluating it
-# against the repo's snapshot list approximates what a pending forget run
-# would still remove: >0 means pruning is behind (e.g. the agent's weekly
-# schedule drifted after restarts). Buckets use each snapshot's own UTC
-# offset, and a snapshot kept for any one criterion (14 distinct days,
-# 8 distinct ISO weeks, 12 distinct months, newest always) counts as kept -
-# the same union restic's policy applies.
+# Retention policy mirrors the agent's restic forget --prune run, read from
+# retention.json (shared with sync-documents.ps1, check-fleet.sh and
+# fleet-dashboard.py). Re-evaluating it against the repo's snapshot list
+# approximates what a pending forget run would still remove: >0 means pruning
+# is behind (e.g. the agent's weekly schedule drifted after restarts).
+# Snapshots are bucketed in UTC, and a snapshot kept for any one criterion
+# (N distinct days, N distinct ISO weeks, N distinct months, newest always)
+# counts as kept - the same union restic's policy applies.
 function Get-PruneBacklog {
     param([object[]]$Snaps)
     $times = @()
@@ -103,7 +138,7 @@ function Get-PruneBacklog {
     $utcTimes = @($times | ForEach-Object { $_.ToUniversalTime() })
     $sorted = @($utcTimes | Sort-Object { $_ } -Descending:$true)
 
-    $KD = 14; $KW = 8; $KM = 12
+    $KD = $script:KeepDaily; $KW = $script:KeepWeekly; $KM = $script:KeepMonthly
     $seenDaily = New-Object "System.Collections.Generic.HashSet[string]"
     $seenWeekly = New-Object "System.Collections.Generic.HashSet[string]"
     $seenMonthly = New-Object "System.Collections.Generic.HashSet[string]"
@@ -116,10 +151,13 @@ function Get-PruneBacklog {
         if (-not $seenDaily.Contains($kb) -and $dailyUsed -lt $KD) {
             [void]$seenDaily.Add($kb); $dailyUsed++; $keep = $true
         }
-        # ISO week per snapshot date (calendar week in UTC)
-        $cal = [System.Globalization.CultureInfo]::InvariantCulture.Calendar
-        $week = $cal.GetWeekOfYear($t, [System.Globalization.CalendarWeekRule]::FirstFourDayWeek, [System.DayOfWeek]::Monday)
-        $wb = "$($t.Year)-W$week"
+        # ISO-8601 week and ISO week-year (Monday-based; week 1 is the week
+        # containing the first Thursday), matching Python's isocalendar() in
+        # check-fleet.sh and the dashboard - including across New Year, where
+        # the old InvariantCulture GetWeekOfYear could disagree by one week.
+        # .NET Framework (PowerShell 5.1) has no ISOWeek class, hence manual.
+        $thursday = $t.Date.AddDays(3 - (([int]$t.DayOfWeek + 6) % 7))
+        $wb = "$($thursday.Year)-W$([int][math]::Floor(($thursday.DayOfYear - 1) / 7) + 1)"
         if (-not $seenWeekly.Contains($wb) -and $weeklyUsed -lt $KW) {
             [void]$seenWeekly.Add($wb); $weeklyUsed++; $keep = $true
         }

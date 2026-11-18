@@ -63,6 +63,39 @@ $PruneStateFile = Join-Path $LogDir "last-prune.txt"   # persisted so agent rest
 $MaxFileSizeMB  = 500     # skip individual files larger than this (installers, ISOs, VM images, etc.)
 $MaxLogSizeMB   = 10      # rotate sync.log once it exceeds this (keeps newest lines, archives rest to sync.log.1)
 
+# ---- Retention policy ----
+# Single source of truth: retention.json, deployed here by the installer and
+# also read by check-fleet.ps1/.sh and fleet-dashboard.py, so the fleet check's
+# "prune backlog" cannot drift from what this agent actually prunes. Missing or
+# invalid file (e.g. a laptop provisioned before this file existed) falls back
+# to the defaults, which are the values these tools all used to hard-code.
+$RetentionFile = Join-Path $LogDir "retention.json"
+$KeepDaily     = 14
+$KeepWeekly    = 8
+$KeepMonthly   = 12
+
+function Read-KeepCount {
+    param($Config, [string]$Name, [int]$Default)
+    if ($null -eq $Config) { return $Default }
+    $raw = $Config.$Name
+    if ($null -eq $raw) { return $Default }
+    $parsed = 0
+    if ([int]::TryParse("$raw", [ref]$parsed) -and $parsed -gt 0) { return $parsed }
+    return $Default
+}
+
+try {
+    if (Test-Path $RetentionFile) {
+        $retentionConfig = Get-Content -Path $RetentionFile -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+        $KeepDaily   = Read-KeepCount -Config $retentionConfig -Name "keepDaily"   -Default $KeepDaily
+        $KeepWeekly  = Read-KeepCount -Config $retentionConfig -Name "keepWeekly"  -Default $KeepWeekly
+        $KeepMonthly = Read-KeepCount -Config $retentionConfig -Name "keepMonthly" -Default $KeepMonthly
+    }
+} catch {
+    # A broken policy file must never stop backups - defaults already applied.
+}
+
 # Prefer the full restic path: the Scheduled Task may start before a
 # machine-PATH change takes effect, so bare `restic` can fail with
 # "command not found" on first install. Falls back to PATH lookup.
@@ -200,9 +233,9 @@ function Invoke-Prune {
     $forgetArgs = @(
         "forget",
         "--tag", $HostName,
-        "--keep-daily", "14",
-        "--keep-weekly", "8",
-        "--keep-monthly", "12",
+        "--keep-daily", "$KeepDaily",
+        "--keep-weekly", "$KeepWeekly",
+        "--keep-monthly", "$KeepMonthly",
         "--prune"
     )
     try {
@@ -235,6 +268,7 @@ try {
 Write-Log "Watched paths: $($SourcePaths -join ', ')"
 Write-Log "Exclude file: $ExcludeFile"
 Write-Log "Max file size: ${MaxFileSizeMB}MB"
+Write-Log "Retention policy: keep-daily $KeepDaily, keep-weekly $KeepWeekly, keep-monthly $KeepMonthly (from $RetentionFile)"
 Write-Log "Repository: $env:RESTIC_REPOSITORY"
 Write-Log "restic: $ResticExe"
 

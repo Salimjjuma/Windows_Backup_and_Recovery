@@ -3,8 +3,8 @@
 # check-fleet.sh
 # Linux (Ubuntu) equivalent of check-fleet.ps1: checks every laptop's
 # restic repository on Wasabi S3 — snapshot count, latest snapshot time,
-# repo size, and prune backlog (snapshots the retention policy kept in
-# sync-documents.ps1 would still remove, a sign pruning is behind).
+# repo size, and prune backlog (snapshots the retention policy — read from
+# retention.json — would still remove, a sign pruning is behind).
 # Auto-installs missing dependencies (restic, AWS CLI).
 #
 # Usage:
@@ -23,6 +23,10 @@ set -uo pipefail
 
 ENDPOINT="${WASABI_ENDPOINT:-https://s3.eu-south-1.wasabisys.com}"
 BUCKET="${BUCKET:-mewabackup}"
+# Retention policy: single source of truth shared with sync-documents.ps1,
+# check-fleet.ps1 and fleet-dashboard.py. Override with RETENTION_FILE=...
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RETENTION_FILE="${RETENTION_FILE:-$SCRIPT_DIR/retention.json}"
 CSV_OUT=""
 DISCOVER=false
 HOSTNAMES=()
@@ -181,16 +185,30 @@ for unit in ['B','KB','MB','GB','TB']:
 " "$1"
 }
 
-# Retention policy mirrors sync-documents.ps1 (restic forget --prune).
-# Re-evaluating it against the repo's snapshot list approximates what a
-# pending forget run would still remove: >0 means pruning is behind
-# (e.g. the agent's schedule drifted after restarts). Buckets use each
-# snapshot's own UTC offset, and a snapshot kept for any one criterion
-# (14 distinct days, 8 distinct ISO weeks, 12 distinct months, newest
-# always) counts as kept - the same union restic's policy applies.
+# Retention policy, read from retention.json (shared with the agent and the
+# other fleet tools). Re-evaluating it against the repo's snapshot list
+# approximates what a pending forget run would still remove: >0 means pruning
+# is behind (e.g. the agent's schedule drifted after restarts). Snapshots are
+# bucketed in UTC, and a snapshot kept for any one criterion (N distinct days,
+# N distinct ISO weeks, N distinct months, newest always) counts as kept - the
+# same union restic's policy applies.
 prune_backlog() {   # stdin: restic snapshots --json  ->  display string
-    python3 -c "
-import json, sys, datetime
+    RETENTION_FILE="$RETENTION_FILE" python3 -c "
+import json, os, sys, datetime
+
+def retention():
+    try:
+        with open(os.environ.get('RETENTION_FILE', ''), encoding='utf-8') as f:
+            cfg = json.load(f)
+        vals = tuple(int(cfg.get(k, d)) for k, d in
+                     (('keepDaily', 14), ('keepWeekly', 8), ('keepMonthly', 12)))
+        if all(v > 0 for v in vals):
+            return vals
+    except Exception:
+        pass
+    return (14, 8, 12)
+
+KD, KW, KM = retention()
 try:
     snaps = [s for s in (json.load(sys.stdin) or []) if isinstance(s,dict) and s.get('time')]
 except Exception:
@@ -208,7 +226,6 @@ if not times:
     print('-')
     sys.exit(0)
 times.sort(reverse=True)
-KD, KW, KM = 14, 8, 12
 seen_d, seen_w, seen_m = set(), set(), set()
 d_used = w_used = m_used = 0
 kept = set()

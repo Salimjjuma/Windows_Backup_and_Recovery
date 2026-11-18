@@ -24,7 +24,7 @@ powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1 -ExtraPaths 
 powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1
 ```
 
-What install does: restic → `C:\Program Files\restic`, password → `C:\ProgramData\DocBackup\restic-password.txt` (ACL'd), machine env vars, `restic init`, watcher → `C:\ProgramData\DocBackup\sync-documents.ps1`, task `DocumentsBackupSync` (logon trigger, auto-restart), starts it.
+What install does: restic → `C:\Program Files\restic`, password → `C:\ProgramData\DocBackup\restic-password.txt` (ACL'd), machine env vars, `restic init`, watcher → `C:\ProgramData\DocBackup\sync-documents.ps1`, retention policy → `C:\ProgramData\DocBackup\retention.json` (kept if already present), task `DocumentsBackupSync` (logon trigger, auto-restart), starts it.
 
 ## 2. Verify after install (laptop)
 
@@ -53,6 +53,27 @@ Restart-ScheduledTask -TaskName DocumentsBackupSync
 Get-Content C:\ProgramData\DocBackup\extra-paths.txt
 Get-Content C:\ProgramData\DocBackup\sync.log -Tail 10   # "Watched paths:" includes the new folder
 ```
+
+## 3b. Retention policy (laptop, admin)
+
+The prune policy lives in `retention.json`, deployed to
+`C:\ProgramData\DocBackup\retention.json`. The agent and all three fleet tools
+read the same file, so changing it changes both what gets pruned and what the
+dashboard's **Prune backlog** column expects.
+
+```powershell
+# Show the effective policy + what the agent loaded at startup
+Get-Content C:\ProgramData\DocBackup\retention.json
+Get-Content C:\ProgramData\DocBackup\sync.log -Tail 20 | Select-String "Retention policy"
+
+# Change it (snapshots to keep per day/week/month), then restart the agent
+notepad C:\ProgramData\DocBackup\retention.json   # {"keepDaily":14,"keepWeekly":8,"keepMonthly":12}
+Restart-ScheduledTask -TaskName DocumentsBackupSync
+```
+
+Missing or invalid file falls back to 14/8/12. If you change a laptop's copy,
+update the repo copy too — otherwise the fleet check evaluates the backlog
+against the old policy.
 
 ## 4. Manual backup / restore (laptop)
 
@@ -107,9 +128,9 @@ python fleet-dashboard.py
 # Click a column header to sort (again to reverse); "Show failures only" filters.
 # Click a laptop name to expand its 10 most recent snapshots. Latest cells older
 # than the Stale threshold (Settings, default 24h) highlight red.
-# "Prune backlog" column: snapshots the retention policy (one per day, plus
-# one per week/month) would still remove - >0 red means that laptop's agent
-# is behind on pruning; check last-prune.txt / sync.log on the laptop.
+# "Prune backlog" column: snapshots the retention policy (retention.json; one
+# per day, plus one per week/month) would still remove - >0 red means that
+# laptop's agent is behind on pruning; check last-prune.txt / sync.log.
 # Growth card tracks total fleet size over time (logged per check on the IT
 # machine only — no Wasabi/laptop changes); needs a few weeks of checks to fill in.
 python fleet-dashboard.py --port 8080

@@ -23,7 +23,6 @@ import html
 import io
 import json
 import math
-import json
 import os
 import shutil
 import subprocess
@@ -118,15 +117,35 @@ def format_bytes(n):
     return f"{n} B"
 
 
-# Retention policy mirrored from sync-documents.ps1 (restic forget --prune,
-# --keep-daily 14 --keep-weekly 8 --keep-monthly 12). Re-evaluating it against
-# the repo's snapshot list approximates what a pending forget run would still
-# remove: >0 means pruning is behind (e.g. the agent's weekly schedule drifted
-# after restarts). Buckets use each snapshot's own UTC offset, and a snapshot
-# kept for any one criterion (14 distinct days, 8 distinct ISO weeks, 12
-# distinct months, newest always) counts as kept - the same union restic's
-# policy applies.
-KEEP_DAILY, KEEP_WEEKLY, KEEP_MONTHLY = 14, 8, 12
+# Retention policy: single source of truth is retention.json (shared with
+# sync-documents.ps1, check-fleet.ps1 and check-fleet.sh). Re-evaluating it
+# against the repo's snapshot list approximates what a pending forget run would
+# still remove: >0 means pruning is behind (e.g. the agent's weekly schedule
+# drifted after restarts). Snapshots are bucketed in UTC, and a snapshot kept
+# for any one criterion (N distinct days, N distinct ISO weeks, N distinct
+# months, newest always) counts as kept - the same union restic's policy
+# applies.
+RETENTION_FILE = os.path.join(BASE_DIR, "retention.json")
+
+
+def load_retention_policy(path=RETENTION_FILE):
+    """Read keepDaily/keepWeekly/keepMonthly, falling back to the defaults.
+
+    A missing or invalid file must not stop the dashboard - older checkouts
+    and freshly cloned repos without the file keep working unchanged.
+    """
+    defaults = (14, 8, 12)
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        values = tuple(int(cfg.get(k, d)) for k, d in
+                       zip(("keepDaily", "keepWeekly", "keepMonthly"), defaults))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return defaults
+    return values if all(v > 0 for v in values) else defaults
+
+
+KEEP_DAILY, KEEP_WEEKLY, KEEP_MONTHLY = load_retention_policy()
 
 
 def prune_backlog(snapshot_times):

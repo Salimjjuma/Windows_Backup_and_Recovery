@@ -11,7 +11,7 @@
 #   4. Deletes the restic password file
 #
 # Optional: -Full also removes restic.exe, the deployed watcher copy,
-#   excludes/extra-paths files, and logs under C:\ProgramData\DocBackup.
+#   excludes/extra-paths/retention files, and logs under C:\ProgramData\DocBackup.
 # =====================================================================
 
 param(
@@ -112,8 +112,9 @@ if ($Full) {
     $ScriptDest     = Join-Path $ConfigDir "sync-documents.ps1"
     $ExcludeFile    = Join-Path $ConfigDir "excludes.txt"
     $ExtraPathsFile = Join-Path $ConfigDir "extra-paths.txt"
+    $RetentionFile  = Join-Path $ConfigDir "retention.json"
     $LogFile        = Join-Path $ConfigDir "sync.log"
-    foreach ($f in @($ScriptDest, $ExcludeFile, $ExtraPathsFile, $LogFile, "$LogFile.1")) {
+    foreach ($f in @($ScriptDest, $ExcludeFile, $ExtraPathsFile, $RetentionFile, $LogFile, "$LogFile.1")) {
         if (Test-Path $f) {
             try { Remove-Item -Path $f -Force -ErrorAction Stop; Write-Host "Deleted: $f" }
             catch { Write-Host "Could not delete ${f}: $_" }
