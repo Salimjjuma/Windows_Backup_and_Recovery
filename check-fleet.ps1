@@ -1,7 +1,9 @@
 # =====================================================================
 # check-fleet.ps1
 # Run by IT (not on staff laptops) to check every laptop's restic
-# repository: snapshot count, latest snapshot time, and repo size.
+# repository: snapshot count, latest snapshot time, repo size, and prune
+# backlog (snapshots the retention policy kept in sync-documents.ps1
+# would still remove — a sign pruning is behind, e.g. after agent restarts).
 #
 # Usage:
 #   powershell -File check-fleet.ps1 -HostNames LAPTOP-1,LAPTOP-2
@@ -75,6 +77,70 @@ function Format-Bytes {
     return "$Bytes B"
 }
 
+# Retention policy mirrors sync-documents.ps1 (restic forget --prune,
+# --keep-daily 14 --keep-weekly 8 --keep-monthly 12). Re-evaluating it
+# against the repo's snapshot list approximates what a pending forget run
+# would still remove: >0 means pruning is behind (e.g. the agent's weekly
+# schedule drifted after restarts). Buckets use each snapshot's own UTC
+# offset, and a snapshot kept for any one criterion (14 distinct days,
+# 8 distinct ISO weeks, 12 distinct months, newest always) counts as kept -
+# the same union restic's policy applies.
+function Get-PruneBacklog {
+    param([object[]]$Snaps)
+    $times = @()
+    foreach ($s in $Snaps) {
+        if (-not $s -or -not $s.time) { continue }
+        try { $dt = [datetime]$s.time } catch { continue }
+        if ($dt.Kind -eq [System.DateTimeKind]::Unspecified) {
+            $dt = [datetime]::SpecifyKind($dt, [System.DateTimeKind]::Utc)
+        }
+        $times += $dt
+    }
+    if ($times.Count -eq 0) { return @{ Count = -1; OldestDays = $null } }
+
+    # ISO 8601 snapshot times parse as Local/UTC via [datetime] casts; work
+    # in one common frame: convert everything to UTC for bucketing AND ages.
+    $utcTimes = @($times | ForEach-Object { $_.ToUniversalTime() })
+    $sorted = @($utcTimes | Sort-Object { $_ } -Descending:$true)
+
+    $KD = 14; $KW = 8; $KM = 12
+    $seenDaily = New-Object "System.Collections.Generic.HashSet[string]"
+    $seenWeekly = New-Object "System.Collections.Generic.HashSet[string]"
+    $seenMonthly = New-Object "System.Collections.Generic.HashSet[string]"
+    $dailyUsed = 0; $weeklyUsed = 0; $monthlyUsed = 0
+    $removable = @()
+    $now = [datetime]::UtcNow
+    foreach ($t in $sorted) {
+        $keep = $false
+        $kb = $t.ToString("yyyy-MM-dd")
+        if (-not $seenDaily.Contains($kb) -and $dailyUsed -lt $KD) {
+            [void]$seenDaily.Add($kb); $dailyUsed++; $keep = $true
+        }
+        # ISO week per snapshot date (calendar week in UTC)
+        $cal = [System.Globalization.CultureInfo]::InvariantCulture.Calendar
+        $week = $cal.GetWeekOfYear($t, [System.Globalization.CalendarWeekRule]::FirstFourDayWeek, [System.DayOfWeek]::Monday)
+        $wb = "$($t.Year)-W$week"
+        if (-not $seenWeekly.Contains($wb) -and $weeklyUsed -lt $KW) {
+            [void]$seenWeekly.Add($wb); $weeklyUsed++; $keep = $true
+        }
+        $mb = $t.ToString("yyyy-MM")
+        if (-not $seenMonthly.Contains($mb) -and $monthlyUsed -lt $KM) {
+            [void]$seenMonthly.Add($mb); $monthlyUsed++; $keep = $true
+        }
+        if (-not $keep) { $removable += $t }
+    }
+    if ($removable.Count -eq 0) { return @{ Count = 0; OldestDays = $null } }
+    $oldest = [math]::Round(($now - ($removable | Measure-Object -Minimum).Minimum).TotalDays)
+    return @{ Count = $removable.Count; OldestDays = [int]$oldest }
+}
+
+function Format-PruneBacklog {
+    param($Info)
+    if ($null -eq $Info -or $Info.Count -lt 0) { return "unknown" }
+    if ($Info.Count -eq 0) { return "none pending" }
+    return "$($Info.Count) snaps ($($Info.OldestDays)d)"
+}
+
 $results = @()
 $failCount = 0
 $i = 0
@@ -91,6 +157,7 @@ foreach ($HostName in $HostNames) {
         Snapshots = 0
         Latest    = ""
         Size      = ""
+        Prune     = "unknown"
     }
 
     # ---- Snapshots (count + latest time) ----
@@ -118,6 +185,7 @@ foreach ($HostName in $HostNames) {
         $latest = $snaps | Sort-Object { $_.time } | Select-Object -Last 1
         $row.Latest = $latest.time
     }
+    $row.Prune = Format-PruneBacklog (Get-PruneBacklog $snaps)
 
     # ---- Repo size (raw data on disk) ----
     $statsJson = & restic stats --mode raw-data --json 2>&1
@@ -145,7 +213,7 @@ Write-Progress -Activity "Checking fleet repositories ($BucketAndPrefix)" -Compl
 
 $env:RESTIC_REPOSITORY = $SavedRepo
 
-$results | Format-Table -AutoSize Name, Status, Snapshots, Latest, Size | Out-String | Write-Host
+$results | Format-Table -AutoSize Name, Status, Snapshots, Latest, Size, Prune | Out-String | Write-Host
 Write-Host "Checked $($HostNames.Count) laptop(s): $($HostNames.Count - $failCount) OK, $failCount FAIL."
 
 if ($failCount -gt 0) { exit 1 }

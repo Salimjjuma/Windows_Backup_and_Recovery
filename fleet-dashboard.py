@@ -118,6 +118,66 @@ def format_bytes(n):
     return f"{n} B"
 
 
+# Retention policy mirrored from sync-documents.ps1 (restic forget --prune,
+# --keep-daily 14 --keep-weekly 8 --keep-monthly 12). Re-evaluating it against
+# the repo's snapshot list approximates what a pending forget run would still
+# remove: >0 means pruning is behind (e.g. the agent's weekly schedule drifted
+# after restarts). Buckets use each snapshot's own UTC offset, and a snapshot
+# kept for any one criterion (14 distinct days, 8 distinct ISO weeks, 12
+# distinct months, newest always) counts as kept - the same union restic's
+# policy applies.
+KEEP_DAILY, KEEP_WEEKLY, KEEP_MONTHLY = 14, 8, 12
+
+
+def prune_backlog(snapshot_times):
+    """Approximate what the retention policy would STILL remove.
+
+    Returns (removable_count, oldest_removable_age_days); (None, None) when
+    nothing is beyond retention (typical for repos in their first ~8 weeks).
+    """
+    def parse(t):
+        try:
+            dt = datetime.fromisoformat(str(t).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    times = [t for t in (parse(s) for s in snapshot_times) if t]
+    if not times:
+        return (None, None)
+    times.sort(reverse=True)
+    seen_daily, seen_weekly, seen_monthly = set(), set(), set()
+    d_used = w_used = m_used = 0
+    kept = set()
+    for idx, t in enumerate(times):
+        keep_here = False
+        kb = (t.year, t.month, t.day)
+        if kb not in seen_daily and d_used < KEEP_DAILY:
+            seen_daily.add(kb); d_used += 1; keep_here = True
+        wb = t.isocalendar()[:2]
+        if wb not in seen_weekly and w_used < KEEP_WEEKLY:
+            seen_weekly.add(wb); w_used += 1; keep_here = True
+        mb = (t.year, t.month)
+        if mb not in seen_monthly and m_used < KEEP_MONTHLY:
+            seen_monthly.add(mb); m_used += 1; keep_here = True
+        if keep_here:
+            kept.add(idx)
+    removable = [t for i, t in enumerate(times) if i not in kept]
+    if not removable:
+        return (0, None)
+    now = datetime.now(timezone.utc)
+    oldest = round((now - min(removable)).total_seconds() / 86400)
+    return (len(removable), oldest)
+
+
+def format_prune_backlog(backlog, oldest_days):
+    if backlog is None:
+        return "unknown"
+    if backlog == 0:
+        return "none pending"
+    return f"{backlog} snaps ({oldest_days}d)"
+
+
 def check_one(hostname, endpoint, bucket):
     """Mirror of check-fleet.ps1 per-laptop logic. Returns a row dict."""
     repo = f"s3:{endpoint}/{bucket}/{hostname}"
@@ -139,7 +199,16 @@ def check_one(hostname, endpoint, bucket):
         row["detail"] = "snapshot output was not valid JSON"
         return row
     row["snapshots"] = len(snaps)
+    row["pruneBacklog"] = None
+    row["pruneOldestDays"] = None
+    row["prune"] = "unknown"
     if snaps:
+        snap_times = [s.get("time", "") for s in snaps
+                      if isinstance(s, dict) and s.get("time")]
+        backlog, oldest_days = prune_backlog(snap_times)
+        row["pruneBacklog"] = backlog
+        row["pruneOldestDays"] = oldest_days
+        row["prune"] = format_prune_backlog(backlog, oldest_days)
         times = sorted(s.get("time", "") for s in snaps if isinstance(s, dict))
         row["latest"] = times[-1] if times else ""
 
@@ -183,7 +252,8 @@ def log_history(results):
              "results": [{"name": r.get("name", ""),
                           "status": r.get("status", ""),
                           "snapshots": r.get("snapshots", 0),
-                          "sizeBytes": r.get("sizeBytes")}
+                          "sizeBytes": r.get("sizeBytes"),
+                          "pruneBacklog": r.get("pruneBacklog")}
                          for r in results]}
     with HISTORY_LOCK:
         try:
@@ -262,12 +332,14 @@ def read_history(days=84):
 def report_csv(results):
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["Name", "Status", "Snapshots", "Latest", "Size", "SizeBytes", "Detail"])
+    w.writerow(["Name", "Status", "Snapshots", "Latest", "Size", "SizeBytes",
+                "Prune backlog", "Detail"])
     for r in results:
         w.writerow([r.get("name", ""), r.get("status", ""),
                     r.get("snapshots", 0), r.get("latest", ""),
                     r.get("size", ""),
                     r.get("sizeBytes") if r.get("sizeBytes") is not None else "",
+                    r.get("prune", "unknown"),
                     r.get("detail", "")])
     return buf.getvalue()
 
@@ -333,13 +405,15 @@ def report_html(results, endpoint, bucket):
     except OSError:
         logo_img = ""
     rows = "\n".join(
-        "<tr><td>{}</td><td class='{}'>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+        "<tr><td>{}</td><td class='{}'>{}</td><td>{}</td><td>{}</td><td>{}</td><td class='{}'>{}</td></tr>".format(
             html.escape(str(r.get("name", ""))),
             "text-success fw-bold" if r.get("status") == "OK" else "text-danger fw-bold",
             html.escape(str(r.get("status", ""))),
             html.escape(str(r.get("snapshots", 0))),
             html.escape(str(r.get("latest", ""))),
-            html.escape(str(r.get("size", ""))))
+            html.escape(str(r.get("size", ""))),
+            "text-danger fw-bold" if isinstance(r.get("pruneBacklog"), int) and r.get("pruneBacklog") > 0 else "text-muted",
+            html.escape(str(r.get("prune", "unknown"))))
         for r in results)
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -353,9 +427,9 @@ def report_html(results, endpoint, bucket):
 <table class="table table-bordered w-auto"><tr><th>Generated</th><th>Bucket</th><th>Endpoint</th></tr>
 <tr><td>{html.escape(stamp)}</td><td><code>{html.escape(bucket)}</code></td><td><code>{html.escape(endpoint)}</code></td></tr></table>
 <p class="alert alert-info"><strong>{ok} OK, {len(results) - ok} FAIL</strong> out of {len(results)} checked.<br>{total_line}.</p>
-<table class="table table-striped table-hover"><thead class="table-light"><tr><th>Name</th><th>Status</th><th>Snapshots</th><th>Latest</th><th>Size</th></tr></thead><tbody>
+<table class="table table-striped table-hover"><thead class="table-light"><tr><th>Name</th><th>Status</th><th>Snapshots</th><th>Latest</th><th>Size</th><th>Prune backlog</th></tr></thead><tbody>
 {rows}
-<tr class="table-group-divider fw-bold"><td>Total</td><td></td><td>{total_snaps}</td><td></td><td>{total_size_cell}</td></tr></tbody></table>
+<tr class="table-group-divider fw-bold"><td>Total</td><td></td><td>{total_snaps}</td><td></td><td>{total_size_cell}</td><td></td></tr></tbody></table>
 {chart}
 <p><button class="btn btn-secondary d-print-none" onclick="window.print()">Print</button></p>
 <footer class="mt-4 pt-3 border-top text-muted d-flex justify-content-between flex-wrap gap-2"><span>Prepared By: ICT Department</span><span>Report generated: {html.escape(stamp)}</span></footer>
@@ -399,7 +473,7 @@ label.form-label{display:block}
 <div id="bar" class="progress mt-3"><div class="progress-bar" role="progressbar" style="width:0%"></div></div>
 <div id="summary" class="mt-2"></div>
 <div class="form-check mt-2"><input class="form-check-input" type="checkbox" id="failOnly" onchange="renderTable()"><label class="form-check-label" for="failOnly">Show failures only</label></div>
-<table id="tbl" class="table table-striped table-hover" hidden><thead class="table-light"><tr><th onclick="sortBy(0)" title="Sort">Name<span id="arr0"></span></th><th onclick="sortBy(1)" title="Sort">Status<span id="arr1"></span></th><th onclick="sortBy(2)" title="Sort">Snapshots<span id="arr2"></span></th><th onclick="sortBy(3)" title="Sort">Latest<span id="arr3"></span></th><th onclick="sortBy(4)" title="Sort">Size<span id="arr4"></span></th></tr></thead></table>
+<table id="tbl" class="table table-striped table-hover" hidden><thead class="table-light"><tr><th onclick="sortBy(0)" title="Sort">Name<span id="arr0"></span></th><th onclick="sortBy(1)" title="Sort">Status<span id="arr1"></span></th><th onclick="sortBy(2)" title="Sort">Snapshots<span id="arr2"></span></th><th onclick="sortBy(3)" title="Sort">Latest<span id="arr3"></span></th><th onclick="sortBy(4)" title="Sort">Size<span id="arr4"></span></th><th onclick="sortBy(5)" title="Snapshots the retention policy would still remove - &gt;0 means pruning is behind">Prune backlog<span id="arr5"></span></th></tr></thead></table>
 </div></div>
 <div class="card mb-4"><div class="card-body">
 <h2 class="card-title h4">Growth</h2>
@@ -417,7 +491,7 @@ function snapKey(name){return 'snaps-'+String(name).replace(/[^A-Za-z0-9_-]/g,'_
 function toggleSnaps(name){if(expanded[name]){delete expanded[name];}else{expanded[name]=true;}renderTable();}
 function detailRow(tbl,r){
 const dr=tbl.insertRow();dr.className='table-active';
-const td=dr.insertCell();td.colSpan=5;
+const td=dr.insertCell();td.colSpan=6;
 const key=snapKey(r.name);
 if(snapCache[r.name]){td.innerHTML=snapCache[r.name];return;}
 td.innerHTML='<div id="'+key+'"><span class="spinner-border spinner-border-sm" role="status"></span> Loading snapshots…</div>';
@@ -436,6 +510,7 @@ function cmpRows(a,b,c){
 if(c===2)return (a.snapshots||0)-(b.snapshots||0);
 if(c===3)return String(a.latest||'').localeCompare(String(b.latest||''));
 if(c===4)return ((typeof a.sizeBytes==='number')?a.sizeBytes:-1)-((typeof b.sizeBytes==='number')?b.sizeBytes:-1);
+if(c===5)return ((typeof a.pruneBacklog==='number')?a.pruneBacklog:-1)-((typeof b.pruneBacklog==='number')?b.pruneBacklog:-1);
 if(c===1)return String(a.status||'').localeCompare(String(b.status||''));
 return String(a.name||'').localeCompare(String(b.name||''));}
 function renderTable(){
@@ -452,8 +527,10 @@ tr.insertCell().textContent=r.snapshots;const lt=tr.insertCell();lt.textContent=
 const t=r.latest?Date.parse(r.latest):NaN;
 if(!isNaN(t)&&Date.now()-t>staleHrs*3600e3){lt.className='text-danger fw-bold';lt.title='Stale: no snapshot within '+staleHrs+'h';}
 tr.insertCell().textContent=r.size;
+const pb=tr.insertCell();pb.textContent=r.prune!=null?r.prune:'unknown';
+if(typeof r.pruneBacklog==='number'&&r.pruneBacklog>0){pb.className='text-danger fw-bold';pb.title='Retention policy ('+r.pruneBacklog+' snapshots) would be trimmed by restic forget - the laptop has not pruned since these aged out of retention';}
 if(expanded[r.name])detailRow(tbl,r);}
-for(let i=0;i<5;i++){const s=document.getElementById('arr'+i);if(s)s.textContent=(i===sortCol?(sortDir>0?' ▲':' ▼'):'');}}
+for(let i=0;i<6;i++){const s=document.getElementById('arr'+i);if(s)s.textContent=(i===sortCol?(sortDir>0?' ▲':' ▼'):'');}}
 function fmtBytes(n){if(n>=1099511627776)return (n/1099511627776).toFixed(2)+' TB';if(n>=1073741824)return (n/1073741824).toFixed(2)+' GB';if(n>=1048576)return (n/1048576).toFixed(1)+' MB';if(n>=1024)return (n/1024).toFixed(1)+' KB';return n+' B';}
 async function loadHistory(){const d=document.getElementById('histDays').value;
 let h;try{h=await api('GET','/api/history?days='+encodeURIComponent(d));}
@@ -708,7 +785,8 @@ def _run_job(job, hosts, endpoint, bucket):
                 except Exception as e:  # noqa: BLE001 - one host must not kill the job
                     row = {"name": futs[fut], "status": f"FAIL error: {e}",
                            "snapshots": 0, "latest": "", "size": "",
-                           "sizeBytes": None}
+                           "sizeBytes": None, "pruneBacklog": None,
+                           "pruneOldestDays": None, "prune": "unknown"}
                 with job["lock"]:
                     job["results"].append(row)
                     job["completed"] += 1

@@ -107,6 +107,9 @@ python fleet-dashboard.py
 # Click a column header to sort (again to reverse); "Show failures only" filters.
 # Click a laptop name to expand its 10 most recent snapshots. Latest cells older
 # than the Stale threshold (Settings, default 24h) highlight red.
+# "Prune backlog" column: snapshots the retention policy (one per day, plus
+# one per week/month) would still remove - >0 red means that laptop's agent
+# is behind on pruning; check last-prune.txt / sync.log on the laptop.
 # Growth card tracks total fleet size over time (logged per check on the IT
 # machine only — no Wasabi/laptop changes); needs a few weeks of checks to fill in.
 python fleet-dashboard.py --port 8080
