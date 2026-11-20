@@ -119,7 +119,11 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 try {
-    $latest = $snapshotOutput | ConvertFrom-Json
+    # 2>&1 above can mix stderr ErrorRecords in - keep stdout JSON only, and
+    # join the lines so ConvertFrom-Json sees one complete document
+    # (same guard as check-fleet.ps1).
+    $snapLines = @($snapshotOutput | Where-Object { $_ -is [string] })
+    $latest = @($snapLines -join "`n" | ConvertFrom-Json)
 } catch {
     Write-Log "RESULT: FAIL - restic command succeeded but output could not be parsed as JSON for $HostName"
     Write-Log "restic output: $snapshotOutput"
@@ -134,8 +138,11 @@ $snapshotId = $latest[0].short_id
 Write-Log "Restoring latest snapshot $snapshotId to $restoreDir"
 
 # ---- 3. Restore into an isolated folder ----
-& restic restore $snapshotId --target $restoreDir 2>&1 | Add-Content -Path $logFile
-if ($LASTEXITCODE -ne 0) {
+# Uses the --json streaming helper so the interactive run gets a live
+# progress bar (long restores otherwise look hung), and the log gets
+# 10% checkpoints instead of pages of raw JSON progress lines.
+$restoreRc = Invoke-ResticWithProgress -ResticArgs @("restore", $snapshotId, "--target", $restoreDir) -Activity "Restoring snapshot $snapshotId"
+if ($restoreRc -ne 0) {
     Write-Log "RESULT: FAIL - restic restore failed for snapshot $snapshotId"
     exit 1
 }

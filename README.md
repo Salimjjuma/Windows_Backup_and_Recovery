@@ -53,9 +53,11 @@ Before provisioning any laptop, IT needs:
   if it is lost, backups made with it are permanently unrecoverable.
 - **Local admin rights** on the laptop being provisioned (the installer
   self-elevates and will prompt for admin if not already running elevated).
-- The three script files, kept together in one folder:
+- The script files, kept together in one folder:
   - `install-backup-agent.ps1`
   - `sync-documents.ps1`
+  - `retention.json` (optional; the shared retention policy — without it
+    the agent and the fleet tools fall back to 14/8/12. See §10.)
   - (`test-restore.ps1` is only needed on an IT admin machine, not on
     staff laptops)
 
@@ -70,8 +72,9 @@ $BucketAndPrefix = "mewabackup"   # <-- change to your actual bucket name
 
 ## 3. Provisioning a new laptop
 
-1. Copy `install-backup-agent.ps1` and `sync-documents.ps1` into the same
-   folder on the target laptop.
+1. Copy `install-backup-agent.ps1`, `sync-documents.ps1` (and
+   `retention.json`, if you have customised it) into the same folder on the
+   target laptop.
 2. Run PowerShell **as the IT technician performing setup**:
 ```powershell
    powershell -ExecutionPolicy Bypass -File install-backup-agent.ps1
@@ -121,8 +124,13 @@ Once installed, no user action is required. Mechanically:
 - A **15-minute failsafe backup** runs regardless, to catch anything missed
   while the laptop was asleep, offline, or the watcher missed an event.
 - Every **7 days**, `restic forget --prune` runs to enforce retention
-  (`--keep-daily 14 --keep-weekly 8 --keep-monthly 12`), so the bucket
-  doesn't grow unbounded while still preserving a meaningful history.
+  (default `--keep-daily 14 --keep-weekly 8 --keep-monthly 12`, read from
+  `retention.json` — see §10), so the bucket doesn't grow unbounded while
+  still preserving a meaningful history.
+  The last-prune timestamp is persisted to
+  `C:\ProgramData\DocBackup\last-prune.txt` and restored at startup, so
+  a reboot or agent restart does **not** reset the weekly countdown (it
+  used to: the timer lived only in script memory).
 - Laptops with extra needs (e.g. the Public folder) list one absolute path
   per line in `C:\ProgramData\DocBackup\extra-paths.txt` (written by
   `install-backup-agent.ps1 -ExtraPaths`, appended on re-runs). These are
@@ -229,6 +237,14 @@ restic restore latest --target C:\Temp\restore --include "path\to\file.docx"
 Get-Content C:\ProgramData\DocBackup\sync.log -Tail 50
 ```
 
+**Check when pruning last ran on a laptop:**
+```powershell
+# Exact timestamp is laptop-local (the state file + sync.log are not
+# visible to the central fleet check):
+Get-Content C:\ProgramData\DocBackup\last-prune.txt   # ISO 8601 timestamp
+Select-String "Retention pruning" C:\ProgramData\DocBackup\sync.log -tail 2
+```
+
 **Fleet dashboard (for non-CLI users):**
 ```powershell
 # On the IT admin machine, with the same env vars set as for test-restore.ps1:
@@ -247,11 +263,12 @@ recreated cleanly.
 
 ## 9. Known limitations / things to watch
 
-- **No central fleet dashboard.** With 20 independently-managed laptops,
-  there's no single place to see "which laptops backed up today." Until
-  something better is in place, rely on periodic spot checks (`restic
-  snapshots` per laptop) and the quarterly restoration test cycle to catch
-  silent failures.
+- **The fleet dashboard is IT-side only.** `fleet-dashboard.py` runs on the
+  IT admin machine and reads the bucket. It does not run on laptops and
+  cannot see laptop-local state (`last-prune.txt`, `sync.log`,
+  `extra-paths.txt`), so anything that needs that (e.g. "why hasn't this
+  pruned yet?") still means logging on to the laptop. It also needs Python
+  3.8+ and `restic` on PATH on that machine.
 - **Redirected Documents folders.** If a laptop has Documents redirected
   into OneDrive (Known Folder Move), this system will back that up too —
   which is redundant with OneDrive's own sync. Check for this before
@@ -274,8 +291,26 @@ recreated cleanly.
 | `install-backup-agent.ps1` | Each staff laptop (once) | Provisions restic, repo, watcher, scheduled task |
 | `sync-documents.ps1` | Each staff laptop (continuously, via Scheduled Task) | Watches + backs up + prunes |
 | `test-restore.ps1` | IT admin machine (on a schedule) | Restoration/integrity testing across laptops |
-| `check-fleet.ps1` | IT admin machine (on demand) | Lists every laptop repo: name, snapshot count, latest time, size |
+| `check-fleet.ps1` | IT admin machine (on demand) | Lists every laptop repo: name, snapshot count, latest time, size, prune backlog |
 | `fleet-dashboard.py` | IT admin machine (local web UI) | Same fleet check as `check-fleet.ps1` in a browser, with CSV/HTML reports |
+| `retention.json` | Repo root + each laptop (`C:\ProgramData\DocBackup\`) | Single source of the prune policy, read by the agent and all three fleet tools |
+
+The **prune backlog** column is computed centrally from each repo's snapshot
+list using the same policy the agent prunes with, read from `retention.json`
+(defaults: `--keep-daily 14 --keep-weekly 8 --keep-monthly 12` — one snapshot
+per day, plus the newest one each week and month within those windows). It
+counts the snapshots that policy would still remove. Read it as:
+
+| Backlog shows | Meaning |
+|---|---|
+| `none pending` | Retention is in force — a forget run now would remove nothing |
+| `N snaps (Xd)` | N snapshots have aged out of retention and are still there: the laptop is behind on pruning (typically the agent restarted before each prune window) |
+| `unknown` | Snapshots could not be listed, or none had usable timestamps |
+
+Cheapest immediate response to a growing backlog is to log on to that laptop
+and check `last-prune.txt` / `sync.log`; `restic forget --prune --tag <host>`
+can also be run centrally earlier than the weekly interval to bring the repo
+back within policy.
 
 Questions or issues with this setup should go to [IT lead / distribution
 list — fill in].

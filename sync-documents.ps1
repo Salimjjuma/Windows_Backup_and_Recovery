@@ -59,8 +59,42 @@ $ExcludeFile    = Join-Path $LogDir "excludes.txt"
 $DebounceSec    = 30      # wait this long after last change before backing up
 $FailsafeMin    = 15      # always do a full backup at least this often
 $PruneHours     = 168     # run retention pruning at least this often (weekly)
+$PruneStateFile = Join-Path $LogDir "last-prune.txt"   # persisted so agent restarts don't reset the weekly countdown
 $MaxFileSizeMB  = 500     # skip individual files larger than this (installers, ISOs, VM images, etc.)
 $MaxLogSizeMB   = 10      # rotate sync.log once it exceeds this (keeps newest lines, archives rest to sync.log.1)
+
+# ---- Retention policy ----
+# Single source of truth: retention.json, deployed here by the installer and
+# also read by check-fleet.ps1/.sh and fleet-dashboard.py, so the fleet check's
+# "prune backlog" cannot drift from what this agent actually prunes. Missing or
+# invalid file (e.g. a laptop provisioned before this file existed) falls back
+# to the defaults, which are the values these tools all used to hard-code.
+$RetentionFile = Join-Path $LogDir "retention.json"
+$KeepDaily     = 14
+$KeepWeekly    = 8
+$KeepMonthly   = 12
+
+function Read-KeepCount {
+    param($Config, [string]$Name, [int]$Default)
+    if ($null -eq $Config) { return $Default }
+    $raw = $Config.$Name
+    if ($null -eq $raw) { return $Default }
+    $parsed = 0
+    if ([int]::TryParse("$raw", [ref]$parsed) -and $parsed -gt 0) { return $parsed }
+    return $Default
+}
+
+try {
+    if (Test-Path $RetentionFile) {
+        $retentionConfig = Get-Content -Path $RetentionFile -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+        $KeepDaily   = Read-KeepCount -Config $retentionConfig -Name "keepDaily"   -Default $KeepDaily
+        $KeepWeekly  = Read-KeepCount -Config $retentionConfig -Name "keepWeekly"  -Default $KeepWeekly
+        $KeepMonthly = Read-KeepCount -Config $retentionConfig -Name "keepMonthly" -Default $KeepMonthly
+    }
+} catch {
+    # A broken policy file must never stop backups - defaults already applied.
+}
 
 # Prefer the full restic path: the Scheduled Task may start before a
 # machine-PATH change takes effect, so bare `restic` can fail with
@@ -199,9 +233,9 @@ function Invoke-Prune {
     $forgetArgs = @(
         "forget",
         "--tag", $HostName,
-        "--keep-daily", "14",
-        "--keep-weekly", "8",
-        "--keep-monthly", "12",
+        "--keep-daily", "$KeepDaily",
+        "--keep-weekly", "$KeepWeekly",
+        "--keep-monthly", "$KeepMonthly",
         "--prune"
     )
     try {
@@ -234,6 +268,7 @@ try {
 Write-Log "Watched paths: $($SourcePaths -join ', ')"
 Write-Log "Exclude file: $ExcludeFile"
 Write-Log "Max file size: ${MaxFileSizeMB}MB"
+Write-Log "Retention policy: keep-daily $KeepDaily, keep-weekly $KeepWeekly, keep-monthly $KeepMonthly (from $RetentionFile)"
 Write-Log "Repository: $env:RESTIC_REPOSITORY"
 Write-Log "restic: $ResticExe"
 
@@ -252,7 +287,56 @@ $unlockOutput | Add-Content -Path $LogFile
 # Initial backup on startup
 Invoke-Backup -Reason "startup"
 $lastFailsafe = Get-Date
-$lastPrune = Get-Date
+
+# ---- Prune schedule state ----
+# $lastPrune used to be reset to "now" on every script start, so any reboot,
+# logoff, or agent crash silently postponed the next prune by a full week.
+# The timestamp is persisted to disk and restored at startup, keeping the
+# weekly cadence anchored to the last actual prune run instead.
+function Set-PruneState {
+    param([datetime]$When)
+    try {
+        # Round-trip ("o") format so it parses back unambiguously, regardless
+        # of the laptop's locale or PowerShell version.
+        Set-Content -Path $PruneStateFile -Value $When.ToString("o") -ErrorAction Stop
+    } catch {
+        Write-Log "Could not write prune state file ${PruneStateFile}: $_"
+    }
+}
+
+function Get-PruneState {
+    try {
+        if (-not (Test-Path $PruneStateFile)) { return $null }
+        $raw = (Get-Content -Path $PruneStateFile -ErrorAction Stop |
+                Where-Object { "$_".Trim() } |
+                Select-Object -First 1)
+        if (-not $raw) { return $null }
+        $normalized = "$raw".Trim()
+        $dt = [datetime]::MinValue
+        if ([datetime]::TryParseExact(
+                $normalized, "o", [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind, [ref]$dt) -or
+            [datetime]::TryParse($normalized, [ref]$dt)) {
+            return $dt
+        }
+    } catch { }
+    return $null
+}
+
+$lastPrune = Get-PruneState
+if ($lastPrune -and $lastPrune -le (Get-Date)) {
+    Write-Log ("Prune schedule restored from {0} (last prune: {1}; next due within {2:N1} h)" -f `
+        $PruneStateFile, $lastPrune.ToString("s"), [math]::Max(0, $PruneHours - ((Get-Date) - $lastPrune).TotalHours))
+} else {
+    if ($lastPrune) {
+        # State from the future (clock rollback / corrupted file) is unsafe -
+        # fall back to starting fresh rather than starving the schedule.
+        Write-Log "Prune state was from the future - ignoring it"
+    }
+    $lastPrune = Get-Date
+    Set-PruneState -When $lastPrune
+    Write-Log "No usable previous prune state found - weekly prune countdown starts now"
+}
 
 # ---- File watchers: subscribe WITHOUT -Action scriptblocks ----
 # Register-ObjectEvent -Action blocks run in separate event runspaces and
@@ -303,6 +387,12 @@ while ($true) {
     }
     if (($now - $lastPrune).TotalHours -ge $PruneHours) {
         Invoke-Prune
+        # Persisted even when the prune FAILED: the timer must not retry
+        # tight-loop and hammer restic. A failed run delays removal by one
+        # interval (snapshots are never lost by postponing - only kept
+        # longer), and a leftover backlog shows up in the fleet check's
+        # prune column.
         $lastPrune = Get-Date
+        Set-PruneState -When $lastPrune
     }
 }

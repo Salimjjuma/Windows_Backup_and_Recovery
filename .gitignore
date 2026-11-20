@@ -1,3 +1,4 @@
 for_system_32_check
 fleet-config.json
 fleet-history.jsonl
+__pycache__/

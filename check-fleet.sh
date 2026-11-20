@@ -3,7 +3,9 @@
 # check-fleet.sh
 # Linux (Ubuntu) equivalent of check-fleet.ps1: checks every laptop's
 # restic repository on Wasabi S3 — snapshot count, latest snapshot time,
-# and repo size. Auto-installs missing dependencies (restic, AWS CLI).
+# repo size, and prune backlog (snapshots the retention policy — read from
+# retention.json — would still remove, a sign pruning is behind).
+# Auto-installs missing dependencies (restic, AWS CLI).
 #
 # Usage:
 #   ./check-fleet.sh LAPTOP-1 LAPTOP-2
@@ -21,6 +23,10 @@ set -uo pipefail
 
 ENDPOINT="${WASABI_ENDPOINT:-https://s3.eu-south-1.wasabisys.com}"
 BUCKET="${BUCKET:-mewabackup}"
+# Retention policy: single source of truth shared with sync-documents.ps1,
+# check-fleet.ps1 and fleet-dashboard.py. Override with RETENTION_FILE=...
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RETENTION_FILE="${RETENTION_FILE:-$SCRIPT_DIR/retention.json}"
 CSV_OUT=""
 DISCOVER=false
 HOSTNAMES=()
@@ -179,6 +185,73 @@ for unit in ['B','KB','MB','GB','TB']:
 " "$1"
 }
 
+# Retention policy, read from retention.json (shared with the agent and the
+# other fleet tools). Re-evaluating it against the repo's snapshot list
+# approximates what a pending forget run would still remove: >0 means pruning
+# is behind (e.g. the agent's schedule drifted after restarts). Snapshots are
+# bucketed in UTC, and a snapshot kept for any one criterion (N distinct days,
+# N distinct ISO weeks, N distinct months, newest always) counts as kept - the
+# same union restic's policy applies.
+prune_backlog() {   # stdin: restic snapshots --json  ->  display string
+    RETENTION_FILE="$RETENTION_FILE" python3 -c "
+import json, os, sys, datetime
+
+def retention():
+    try:
+        with open(os.environ.get('RETENTION_FILE', ''), encoding='utf-8') as f:
+            cfg = json.load(f)
+        vals = tuple(int(cfg.get(k, d)) for k, d in
+                     (('keepDaily', 14), ('keepWeekly', 8), ('keepMonthly', 12)))
+        if all(v > 0 for v in vals):
+            return vals
+    except Exception:
+        pass
+    return (14, 8, 12)
+
+KD, KW, KM = retention()
+try:
+    snaps = [s for s in (json.load(sys.stdin) or []) if isinstance(s,dict) and s.get('time')]
+except Exception:
+    print('unknown')
+    sys.exit(0)
+def parse(t):
+    try:
+        dt = datetime.datetime.fromisoformat(str(t).replace('Z','+00:00'))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)
+times = [parse(s['time']) for s in snaps]
+times = [t for t in times if t]
+if not times:
+    print('-')
+    sys.exit(0)
+times.sort(reverse=True)
+seen_d, seen_w, seen_m = set(), set(), set()
+d_used = w_used = m_used = 0
+kept = set()
+for idx, t in enumerate(times):
+    keep_here = False
+    kb = (t.year, t.month, t.day)
+    if kb not in seen_d and d_used < KD:
+        seen_d.add(kb); d_used += 1; keep_here = True
+    wb = t.isocalendar()[:2]
+    if wb not in seen_w and w_used < KW:
+        seen_w.add(wb); w_used += 1; keep_here = True
+    mb = (t.year, t.month)
+    if mb not in seen_m and m_used < KM:
+        seen_m.add(mb); m_used += 1; keep_here = True
+    if keep_here:
+        kept.add(idx)
+removable = [t for i, t in enumerate(times) if i not in kept]
+if not removable:
+    print('none pending')
+else:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    oldest = round((now - min(removable)).total_seconds() / 86400)
+    print(f'{len(removable)} snaps ({oldest}d)')
+"
+}
+
 ensure_restic
 
 # ---- Discover laptop prefixes if none were passed ----
@@ -211,18 +284,23 @@ fi
 
 # ---- Check each repo ----
 SAVED_REPO="${RESTIC_REPOSITORY:-}"
-results=()   # name|status|snapshots|latest|size
+results=()   # name|status|snapshots|latest|size|prune
 fail_count=0
 i=0
+# Per-host stderr capture file: keeps restic's warnings off stdout so they
+# can't contaminate the JSON parsed below (a mixed-in warning line would
+# report a false "FAIL parse"), and lets failures show the real reason.
+_errfile="$(mktemp)"
+trap 'rm -f "$_errfile"' EXIT
 for host in "${HOSTNAMES[@]}"; do
     i=$((i + 1))
     echo "[$i/${#HOSTNAMES[@]}] $host..." >&2
     export RESTIC_REPOSITORY="s3:$ENDPOINT/$BUCKET/$host"
 
-    snap_json="$(restic snapshots --json 2>&1)" || {
-        results+=("$host|FAIL snapshots|0||")
+    snap_json="$(restic snapshots --json 2>"$_errfile")" || {
+        results+=("$host|FAIL snapshots|0|||")
         fail_count=$((fail_count + 1))
-        echo "WARNING: $host: could not list snapshots." >&2
+        echo "WARNING: $host: could not list snapshots: $(tail -c 500 "$_errfile" | tr '\n' ' ')" >&2
         continue
     }
     parsed="$(printf '%s' "$snap_json" | python3 -c "
@@ -237,16 +315,18 @@ times = sorted(s.get('time','') for s in snaps if isinstance(s, dict) and s.get(
 print(times[-1] if times else '')
 " 2>&1)" || parsed="PARSE_ERROR"
     if [[ "$parsed" == "PARSE_ERROR" ]]; then
-        results+=("$host|FAIL parse|0||")
+        results+=("$host|FAIL parse|0|||")
         fail_count=$((fail_count + 1))
         echo "WARNING: $host: snapshot output was not valid JSON." >&2
         continue
     fi
     snap_count="$(printf '%s' "$parsed" | sed -n '1p')"
     latest="$(printf '%s' "$parsed" | sed -n '2p')"
+    prune="$(printf '%s' "$snap_json" | prune_backlog)"
 
     size="unknown"
-    stats_json="$(restic stats --mode raw-data --json 2>&1)" && {
+    # stderr to file, same reason as the snapshots call above
+    stats_json="$(restic stats --mode raw-data --json 2>"$_errfile")" && {
         total="$(printf '%s' "$stats_json" | python3 -c "
 import json,sys
 try:
@@ -258,31 +338,31 @@ except Exception:
     }
 
     if [[ "$snap_count" == "0" ]]; then
-        results+=("$host|FAIL empty|0|$latest|$size")
+        results+=("$host|FAIL empty|0|$latest|$size|-")
         fail_count=$((fail_count + 1))
     else
-        results+=("$host|OK|$snap_count|$latest|$size")
+        results+=("$host|OK|$snap_count|$latest|$size|$prune")
     fi
 done
 
 if [[ -n "$SAVED_REPO" ]]; then export RESTIC_REPOSITORY="$SAVED_REPO"; else unset RESTIC_REPOSITORY; fi
 
 # ---- Report ----
-printf '\n%-28s %-14s %9s  %-26s %10s\n' "Name" "Status" "Snapshots" "Latest" "Size"
-printf '%s\n' "--------------------------------------------------------------------------------------------"
+printf '\n%-28s %-14s %9s  %-26s %10s  %s\n' "Name" "Status" "Snapshots" "Latest" "Size" "Prune backlog"
+printf '%s\n' "--------------------------------------------------------------------------------------------------------"
 for row in "${results[@]:-}"; do
-    IFS='|' read -r name status snaps latest size <<<"$row"
-    printf '%-28s %-14s %9s  %-26s %10s\n' "$name" "$status" "$snaps" "$latest" "$size"
+    IFS='|' read -r name status snaps latest size prune <<<"$row"
+    printf '%-28s %-14s %9s  %-26s %10s  %s\n' "$name" "$status" "$snaps" "$latest" "$size" "${prune:--}"
 done
 printf '\nChecked %d laptop(s): %d OK, %d FAIL.\n' \
     "${#HOSTNAMES[@]}" "$((${#HOSTNAMES[@]} - fail_count))" "$fail_count"
 
 if [[ -n "$CSV_OUT" ]]; then
     {
-        echo "name,status,snapshots,latest,size"
+        echo "name,status,snapshots,latest,size,prune_backlog"
         for row in "${results[@]:-}"; do
-            IFS='|' read -r name status snaps latest size <<<"$row"
-            printf '"%s","%s",%s,"%s","%s"\n' "$name" "$status" "$snaps" "$latest" "$size"
+            IFS='|' read -r name status snaps latest size prune <<<"$row"
+            printf '"%s","%s",%s,"%s","%s","%s"\n' "$name" "$status" "$snaps" "$latest" "$size" "$prune"
         done
     } >"$CSV_OUT"
     echo "CSV written to $CSV_OUT"
