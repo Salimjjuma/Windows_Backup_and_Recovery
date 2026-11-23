@@ -2,15 +2,32 @@
 # sync-documents.ps1  (restic edition)
 # Continuously backs up the current user's Documents and Desktop
 # folders (plus any extra folders listed in extra-paths.txt) to a
-# per-laptop restic repository on Wasabi S3.
+# per-laptop (legacy) or per-account restic repository on Wasabi S3.
 # Triggered on file change (debounced) + a periodic failsafe backup +
 # weekly retention pruning. Intended to run under a Scheduled Task at logon.
 #
+# The installer passes -BackupId and -ConfigDir in per-account mode. With
+# no parameters it behaves exactly as the original single-account agent:
+# repo from RESTIC_REPOSITORY, tag COMPUTERNAME, config in
+# C:\ProgramData\DocBackup.
+#
 # Assumes the following machine-level environment variables are
 # already set by install-backup-agent.ps1:
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, RESTIC_REPOSITORY,
-#   RESTIC_PASSWORD_FILE
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, RESTIC_PASSWORD_FILE
+# (and RESTIC_REPOSITORY in legacy mode; per-account mode derives the repo
+#  from backup-config.json + -BackupId instead).
 # =====================================================================
+
+param(
+    # Per-account backup ID, e.g. LAPTOP-1-Acc2. Also used as the snapshot
+    # tag and as the last segment of the repository path. Empty = legacy
+    # single-account mode.
+    [string]$BackupId = "",
+
+    # Where this account's logs/state/excludes/extra-paths/backup-config
+    # live. Defaults to the legacy shared folder.
+    [string]$ConfigDir = ""
+)
 
 $ErrorActionPreference = "Continue"
 # NOT "Stop": this script repeatedly runs restic.exe and checks
@@ -47,13 +64,50 @@ $consolePtr = [Console.Window]::GetConsoleWindow()
 #     return $folder
 # }
 
+if (-not $ConfigDir) { $ConfigDir = "$env:ProgramData\DocBackup" }
+
+# Shared endpoint/bucket/excludes. Optional: if the file is absent (e.g. an
+# old deployment that has not been re-installed yet) the built-in defaults
+# below are used, matching the original hard-coded behaviour.
+function Read-BackupConfigFile {
+    param([string]$Dir)
+    $path = Join-Path $Dir "backup-config.json"
+    if (Test-Path $path) {
+        try {
+            return Get-Content -Path $path -Raw -ErrorAction Stop |
+                ConvertFrom-Json -ErrorAction Stop
+        } catch { return $null }
+    }
+    return $null
+}
+$BackupConfig = Read-BackupConfigFile -Dir $ConfigDir
+
+$DefaultExcludes = @(
+    "# restic exclude patterns - one glob pattern per line, # for comments",
+    "# Temp / lock files",
+    "*.tmp",
+    "~`$*",
+    "desktop.ini",
+    "# Media files excluded from backup per IT policy",
+    "*.mp4",
+    "*.mp3",
+    "*.jpeg",
+    "*.jpg",
+    "*.png"
+)
+$EffectiveExcludes = $DefaultExcludes
+if ($BackupConfig -and $BackupConfig.excludes) {
+    $EffectiveExcludes = @($BackupConfig.excludes | ForEach-Object { "$_" })
+}
+
 $SourcePaths = @(
     [Environment]::GetFolderPath("MyDocuments"),
     [Environment]::GetFolderPath("Desktop")
 ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
 
 $HostName       = $env:COMPUTERNAME
-$LogDir         = "$env:ProgramData\DocBackup"
+$Tag            = if ($BackupId) { $BackupId } else { $HostName }
+$LogDir         = $ConfigDir
 $LogFile        = Join-Path $LogDir "sync.log"
 $ExcludeFile    = Join-Path $LogDir "excludes.txt"
 $DebounceSec    = 30      # wait this long after last change before backing up
@@ -96,11 +150,18 @@ try {
     # A broken policy file must never stop backups - defaults already applied.
 }
 
-# Prefer the full restic path: the Scheduled Task may start before a
+# Prefer an existing restic.exe: the Scheduled Task may start before a
 # machine-PATH change takes effect, so bare `restic` can fail with
-# "command not found" on first install. Falls back to PATH lookup.
-$ResticExe = Join-Path $env:ProgramFiles "restic\restic.exe"
-if (-not (Test-Path $ResticExe)) { $ResticExe = "restic" }
+# "command not found" on first install. Falls back to PATH lookup. Checks
+# both Program Files roots because a 32-bit shell reports the (x86) one.
+$ResticExe = $null
+foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+    if ($pf) {
+        $candidate = Join-Path $pf "restic\restic.exe"
+        if (Test-Path $candidate) { $ResticExe = $candidate; break }
+    }
+}
+if (-not $ResticExe) { $ResticExe = "restic" }
 
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
@@ -115,19 +176,7 @@ $script:BackupRunning = $false
 # IT staff can edit this file directly on any laptop (or push an updated
 # version) without touching this script.
 if (-not (Test-Path $ExcludeFile)) {
-    @'
-# restic exclude patterns - one glob pattern per line, # for comments
-# Temp / lock files
-*.tmp
-~$*
-desktop.ini
-# Media files excluded from backup per IT policy
-*.mp4
-*.mp3
-*.jpeg
-*.jpg
-*.png
-'@ | Set-Content -Path $ExcludeFile
+    $EffectiveExcludes | Set-Content -Path $ExcludeFile
 }
 
 function Write-Log {
@@ -136,11 +185,35 @@ function Write-Log {
     Add-Content -Path $LogFile -Value $line
 }
 
-# Per-machine extra folders (e.g. C:\Users\Public on laptops that need it).
-# Optional file: one absolute path per line, # for comments, blank lines
-# ignored. Entries must exist (warn-and-skip otherwise) and are deduplicated
-# against the built-in Documents + Desktop set. Same repo, same hostname
-# tag, same excludes/size cap as everything else.
+# ---- Repository ----
+# Per-account mode (-BackupId passed): derive the repo from the shared
+# backup-config.json so two tasks on one machine can point at two repos.
+# Legacy mode: keep using RESTIC_REPOSITORY exactly as before.
+$ConfiguredRepo = $null
+if ($BackupConfig -and $BackupConfig.wasabiEndpoint -and $BackupConfig.bucketAndPrefix) {
+    $ConfiguredRepo = "s3:$($BackupConfig.wasabiEndpoint)/$($BackupConfig.bucketAndPrefix)/$Tag"
+}
+if ($BackupId) {
+    if ($ConfiguredRepo) {
+        $Repository = $ConfiguredRepo
+    } else {
+        Write-Log "WARNING: backup-config.json missing or incomplete - falling back to RESTIC_REPOSITORY for the per-account repo."
+        $Repository = $env:RESTIC_REPOSITORY
+    }
+} else {
+    $Repository = if ($env:RESTIC_REPOSITORY) { $env:RESTIC_REPOSITORY } else { $ConfiguredRepo }
+}
+if (-not $Repository) {
+    Write-Log "FATAL: no repository configured (per-account needs backup-config.json; legacy needs RESTIC_REPOSITORY). Agent cannot continue."
+    exit 1
+}
+$env:RESTIC_REPOSITORY = $Repository
+
+# Per-machine/per-account extra folders (e.g. C:\Users\Public on laptops that
+# need it). Optional file: one absolute path per line, # for comments, blank
+# lines ignored. Entries must exist (warn-and-skip otherwise) and are
+# deduplicated against the built-in Documents + Desktop set. Same repo, same
+# snapshot tag, same excludes/size cap as everything else.
 $ExtraPathsFile = Join-Path $LogDir "extra-paths.txt"
 if (Test-Path $ExtraPathsFile) {
     $ExtraPaths = Get-Content -Path $ExtraPathsFile |
@@ -167,7 +240,7 @@ function Invoke-Backup {
 
     Write-Log "Backup starting ($Reason) - paths: $($SourcePaths -join ', ')"
     $resticArgs = @("backup") + $SourcePaths + @(
-        "--tag", $HostName,
+        "--tag", $Tag,
         "--exclude-file", $ExcludeFile,
         "--exclude-larger-than", "${MaxFileSizeMB}M",
         "--skip-if-unchanged",
@@ -232,7 +305,7 @@ function Invoke-Prune {
     Write-Log "Retention pruning starting"
     $forgetArgs = @(
         "forget",
-        "--tag", $HostName,
+        "--tag", $Tag,
         "--keep-daily", "$KeepDaily",
         "--keep-weekly", "$KeepWeekly",
         "--keep-monthly", "$KeepMonthly",
@@ -251,7 +324,7 @@ function Invoke-Prune {
     }
 }
 
-Write-Log "=== sync-documents (restic) starting for $HostName ==="
+Write-Log "=== sync-documents (restic) starting for $Tag ==="
 # Rotate sync.log so it can't grow forever: 15-minute backups + progress
 # lines append constantly. Keeps the newest ~2000 lines live, archives the
 # rest to sync.log.1 (overwritten each rotation).
@@ -269,17 +342,19 @@ Write-Log "Watched paths: $($SourcePaths -join ', ')"
 Write-Log "Exclude file: $ExcludeFile"
 Write-Log "Max file size: ${MaxFileSizeMB}MB"
 Write-Log "Retention policy: keep-daily $KeepDaily, keep-weekly $KeepWeekly, keep-monthly $KeepMonthly (from $RetentionFile)"
-Write-Log "Repository: $env:RESTIC_REPOSITORY"
+Write-Log "Repository: $Repository"
+Write-Log "Snapshot tag: $Tag"
 Write-Log "restic: $ResticExe"
 
 # Clear any stale lock left behind by an unclean shutdown (sleep, crash,
 # forced logoff) during a previous backup. Safe here specifically because
-# only one instance of this agent runs per laptop (single scheduled
-# task) - so at a fresh script start, any existing lock cannot belong to
-# a still-running process from this laptop. If someone is separately
-# running restic manually against this same repository at this exact
-# moment, this could clear their lock too - an accepted low-probability
-# tradeoff for a system that must otherwise self-recover unattended.
+# only one instance of this agent runs per repository (one scheduled task
+# per laptop in legacy mode, one per account in per-account mode) - so at a
+# fresh script start, any existing lock cannot belong to a still-running
+# process from this machine. If someone is separately running restic
+# manually against this same repository at this exact moment, this could
+# clear their lock too - an accepted low-probability tradeoff for a system
+# that must otherwise self-recover unattended.
 Write-Log "Checking for stale locks..."
 $unlockOutput = & $ResticExe unlock 2>&1
 $unlockOutput | Add-Content -Path $LogFile

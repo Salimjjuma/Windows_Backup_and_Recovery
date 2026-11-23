@@ -34,6 +34,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "fleet-config.json")
+# Shared with install-backup-agent.ps1, sync-documents.ps1, test-restore.ps1,
+# check-fleet.ps1/.sh: one place for endpoint/bucket (and excludes).
+BACKUP_CONFIG_FILE = os.path.join(BASE_DIR, "backup-config.json")
 
 DEFAULTS = {
     "endpoint": "https://s3.eu-south-1.wasabisys.com",
@@ -52,12 +55,30 @@ MAX_WORKERS = 6
 
 def load_config():
     cfg = dict(DEFAULTS)
+    # backup-config.json is the shared source of truth for endpoint/bucket.
+    # fleet-config.json keeps the dashboard-only state (hostnames, stale
+    # hours); its endpoint/bucket are only used as a per-key legacy fallback
+    # when the shared file is missing or incomplete.
+    shared = {}
+    try:
+        with open(BACKUP_CONFIG_FILE, "r", encoding="utf-8") as f:
+            shared = json.load(f) or {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        shared = {}
+    if shared.get("wasabiEndpoint"):
+        cfg["endpoint"] = shared["wasabiEndpoint"]
+    if shared.get("bucketAndPrefix"):
+        cfg["bucket"] = shared["bucketAndPrefix"]
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             saved = json.load(f)
         for k in DEFAULTS:
-            if k in saved:
+            if k in saved and k not in ("endpoint", "bucket"):
                 cfg[k] = saved[k]
+        if not shared.get("wasabiEndpoint") and saved.get("endpoint"):
+            cfg["endpoint"] = saved["endpoint"]
+        if not shared.get("bucketAndPrefix") and saved.get("bucket"):
+            cfg["bucket"] = saved["bucket"]
     except (FileNotFoundError, json.JSONDecodeError):
         pass
     return cfg
@@ -66,6 +87,21 @@ def load_config():
 def save_config(cfg):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+    # Keep endpoint/bucket synchronised into the shared config so the laptop
+    # installer/agent and the other fleet tools see the same values.
+    shared = {}
+    try:
+        with open(BACKUP_CONFIG_FILE, "r", encoding="utf-8") as f:
+            shared = json.load(f) or {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        shared = {}
+    shared["wasabiEndpoint"] = cfg["endpoint"]
+    shared["bucketAndPrefix"] = cfg["bucket"]
+    try:
+        with open(BACKUP_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(shared, f, indent=2)
+    except OSError:
+        pass
 
 
 def env_status():

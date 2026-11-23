@@ -1,0 +1,17 @@
+{
+  "wasabiEndpoint": "https://s3.eu-south-1.wasabisys.com",
+  "bucketAndPrefix": "mewabackup",
+  "excludes": [
+    "# restic exclude patterns - one glob pattern per line, # for comments",
+    "# Temp / lock files",
+    "*.tmp",
+    "~$*",
+    "desktop.ini",
+    "# Media files excluded from backup per IT policy",
+    "*.mp4",
+    "*.mp3",
+    "*.jpeg",
+    "*.jpg",
+    "*.png"
+  ]
+}

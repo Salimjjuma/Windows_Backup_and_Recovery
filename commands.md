@@ -14,6 +14,11 @@ powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1
 # Staff owner is not the logged-on user (or nobody logged on)
 powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1 -TaskUser "DOMAIN\staffuser"
 
+# Multiple local accounts on one laptop: run once per account with -PerAccount.
+# Each gets its own repo/task/log dir (COMPUTERNAME-Acc1, COMPUTERNAME-Acc2).
+powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1 -PerAccount -TaskUser "$env:COMPUTERNAME\Acc1"
+powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1 -PerAccount -TaskUser "$env:COMPUTERNAME\Acc2"
+
 # With extra folders, no prompt for them
 powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1 -ExtraPaths "C:\Users\Public"
 powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1 -ExtraPaths "C:\Users\Public","D:\Work"
@@ -24,16 +29,26 @@ powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1 -ExtraPaths 
 powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1
 ```
 
-What install does: restic → `C:\Program Files\restic`, password → `C:\ProgramData\DocBackup\restic-password.txt` (ACL'd), machine env vars, `restic init`, watcher → `C:\ProgramData\DocBackup\sync-documents.ps1`, retention policy → `C:\ProgramData\DocBackup\retention.json` (kept if already present), task `DocumentsBackupSync` (logon trigger, auto-restart), starts it.
+What install does: restic → `C:\Program Files\restic`, password → `C:\ProgramData\DocBackup\restic-password.txt` (ACL'd; read access granted to every configured backup task user), machine env vars, `restic init`, watcher → `C:\ProgramData\DocBackup\sync-documents.ps1`, shared config → `C:\ProgramData\DocBackup\backup-config.json`, retention policy → `C:\ProgramData\DocBackup\retention.json` (kept if already present), task `DocumentsBackupSync` (logon trigger, auto-restart), starts it.
+
+With `-PerAccount`, the same steps use `COMPUTERNAME-<account>` as the repo/tag, `DocumentsBackupSync-<account>` as the task, and `C:\ProgramData\DocBackup\Accounts\<account>\` for the watcher/logs/excludes/extra-paths; the password file and AWS keys remain shared.
 
 ## 2. Verify after install (laptop)
 
 ```powershell
+# Default / legacy
 restic snapshots
 Get-ScheduledTask -TaskName DocumentsBackupSync
 Get-Content C:\ProgramData\DocBackup\sync.log -Tail 50
 [Environment]::GetEnvironmentVariable("RESTIC_REPOSITORY", "Machine")
-([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole("Administrator")  # must be True for install/uninstall
+
+# Per-account (repo/tag = COMPUTERNAME-<account>)
+restic -r "s3:https://s3.eu-south-1.wasabisys.com/mewabackup/$env:COMPUTERNAME-Acc2" snapshots
+Get-ScheduledTask -TaskName DocumentsBackupSync-Acc2
+Get-Content C:\ProgramData\DocBackup\Accounts\Acc2\sync.log -Tail 50
+
+# Must be True for install/uninstall
+([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole("Administrator")
 ```
 
 Expect: ≥1 snapshot, task `Ready/Running`, log shows `Backup completed successfully`.
@@ -44,6 +59,10 @@ Expect: ≥1 snapshot, task `Ready/Running`, log shows `Backup completed success
 # Option A: command line (no reinstall, no key prompts)
 Add-Content C:\ProgramData\DocBackup\extra-paths.txt "D:\NewFolder"
 Restart-ScheduledTask -TaskName DocumentsBackupSync
+
+# Per-account: use that account's file and task
+Add-Content C:\ProgramData\DocBackup\Accounts\Acc2\extra-paths.txt "D:\NewFolder"
+Restart-ScheduledTask -TaskName DocumentsBackupSync-Acc2
 
 # Option B: open C:\ProgramData\DocBackup\extra-paths.txt in Notepad,
 # add one absolute path per line (# = comment), save, then:
@@ -69,6 +88,10 @@ Get-Content C:\ProgramData\DocBackup\sync.log -Tail 20 | Select-String "Retentio
 # Change it (snapshots to keep per day/week/month), then restart the agent
 notepad C:\ProgramData\DocBackup\retention.json   # {"keepDaily":14,"keepWeekly":8,"keepMonthly":12}
 Restart-ScheduledTask -TaskName DocumentsBackupSync
+
+# Per-account: each account has its own copy + task
+notepad C:\ProgramData\DocBackup\Accounts\Acc2\retention.json
+Restart-ScheduledTask -TaskName DocumentsBackupSync-Acc2
 ```
 
 Missing or invalid file falls back to 14/8/12. If you change a laptop's copy,
@@ -78,11 +101,15 @@ against the old policy.
 ## 4. Manual backup / restore (laptop)
 
 ```powershell
-# Manual backup of Documents now
+# Manual backup of Documents now (default / legacy)
 restic backup "$env:USERPROFILE\Documents" --tag $env:COMPUTERNAME
+
+# Per-account: target the account's repo + tag explicitly
+restic -r "s3:https://s3.eu-south-1.wasabisys.com/mewabackup/$env:COMPUTERNAME-Acc2" backup "$env:USERPROFILE\Documents" --tag "$env:COMPUTERNAME-Acc2"
 
 # Restore one file to a temp location (never over the original)
 restic restore latest --target C:\Temp\restore --include "path\to\file.docx"
+# Per-account restore: add -r "<repo>"; restore "latest" from that account's repo only
 
 # View recent log activity
 Get-Content C:\ProgramData\DocBackup\sync.log -Tail 50
@@ -95,17 +122,28 @@ Start-ScheduledTask -TaskName DocumentsBackupSync
 Stop-ScheduledTask -TaskName DocumentsBackupSync
 Restart-ScheduledTask -TaskName DocumentsBackupSync
 Get-ScheduledTask -TaskName DocumentsBackupSync | Select State, LastRunTime, LastTaskResult
+
+# Per-account: use DocumentsBackupSync-<account>
+Get-ScheduledTask -TaskName DocumentsBackupSync-Acc2 | Select State, LastRunTime, LastTaskResult
+Restart-ScheduledTask -TaskName DocumentsBackupSync-Acc2
+
+# List every backup task on the machine
+Get-ScheduledTask | Where-Object { $_.TaskName -like 'DocumentsBackupSync*' } | Select TaskName, State
 ```
 
 ## 6. Uninstall (laptop, admin)
 
 ```powershell
-# Stops task + watchers, deletes 4 machine env vars, deletes restic-password.txt.
-# Keeps restic.exe, logs, excludes.
+# Stops that task + its watcher. Deletes the 4 shared machine env vars and
+# restic-password.txt ONLY if no other backup task remains.
 powershell -ExecutionPolicy Bypass -File .\uninstall-backup-agent.ps1
 
-# Full wipe: also removes restic.exe, deployed watcher, excludes/extra-paths, logs
-powershell -ExecutionPolicy Bypass -File .\uninstall-backup-agent.ps1 -Full
+# Per-account: remove only one account's agent (other accounts stay intact)
+powershell -ExecutionPolicy Bypass -File .\uninstall-backup-agent.ps1 -Account Acc2
+
+# Full wipe of this agent: also removes its deployed watcher/config/excludes/logs.
+# restic.exe + shared secrets are removed only when no backup task remains.
+powershell -ExecutionPolicy Bypass -File .\uninstall-backup-agent.ps1 -Account Acc2 -Full
 ```
 
 ## 7. Fleet checks (IT admin machine)
@@ -163,12 +201,19 @@ export RESTIC_PASSWORD_FILE="$HOME/.restic-password"   # chmod 600, never commit
 
 Exit code is 1 if any laptop FAILs (usable in cron/CI).
 
+Per-account backups appear as separate repositories/labels, e.g.
+`LAPTOP-1-Acc1` and `LAPTOP-1-Acc2`. Pass those names to the fleet tools
+(or let discovery list them) — no other change is needed.
+
 ## 8. Restoration tests (IT admin machine)
 
 ```powershell
 # Integrity check + restore latest snapshot to C:\RestoreTests\<host>-<stamp>\, logs PASS/FAIL, cleans up
 powershell -File .\test-restore.ps1 -HostName LAPTOP-JSMITH
 Get-Content C:\RestoreTests\restore-test-log.txt -Tail 20
+
+# Per-account: test that account's repo independently
+powershell -File .\test-restore.ps1 -HostName LAPTOP-JSMITH-Acc2
 ```
 
 Recommended cadence: rotate through all laptops quarterly (~2/week for 20 laptops); investigate FAIL immediately.
@@ -184,6 +229,9 @@ restic init --verbose   # run once per laptop repo; skipped by installer if it e
 restic snapshots
 ```
 
+Per-account repos use `$env:COMPUTERNAME-Acc1` (etc.) instead of
+`$env:COMPUTERNAME`; the installer creates them automatically.
+
 ```powershell
 # S3-level test (needs AWS CLI) — fails here too = keys/policy/bucket, restic is innocent
 aws s3 ls s3://mewabackup --endpoint-url https://s3.eu-south-1.wasabisys.com
@@ -194,5 +242,10 @@ aws s3 ls s3://mewabackup --endpoint-url https://s3.eu-south-1.wasabisys.com
 Symptom in `sync.log`: `open C:\ProgramData\DocBackup\restic-password.txt: Access is denied.`
 
 ```powershell
+# Default / legacy
 powershell -ExecutionPolicy Bypass -File .\fix-password-file-access.ps1
 ```
+
+The fix grants read to SYSTEM, Administrators and **all** configured backup
+task users, then restarts every backup task, so it is safe to run on a
+per-account machine without locking another account out.

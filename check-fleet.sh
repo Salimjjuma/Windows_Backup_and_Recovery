@@ -16,16 +16,26 @@
 #
 # Requires in the environment (same as the Windows IT tooling):
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, RESTIC_PASSWORD_FILE
-# Optional overrides: WASABI_ENDPOINT, BUCKET.
+# Optional overrides: WASABI_ENDPOINT, BUCKET, BACKUP_CONFIG.
+# Default endpoint/bucket come from backup-config.json when present.
 # =====================================================================
 
 set -uo pipefail
 
-ENDPOINT="${WASABI_ENDPOINT:-https://s3.eu-south-1.wasabisys.com}"
-BUCKET="${BUCKET:-mewabackup}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Shared endpoint/bucket (backup-config.json). Environment variables and the
+# --endpoint/--bucket flags still override these values.
+CONFIG_FILE="${BACKUP_CONFIG:-$SCRIPT_DIR/backup-config.json}"
+_cfg_endpoint=""
+_cfg_bucket=""
+if [[ -f "$CONFIG_FILE" ]] && command -v python3 >/dev/null 2>&1; then
+    _cfg_endpoint="$(python3 -c "import json,sys; print((json.load(open(sys.argv[1], encoding='utf-8')) or {}).get('wasabiEndpoint','') or '')" "$CONFIG_FILE" 2>/dev/null || true)"
+    _cfg_bucket="$(python3 -c "import json,sys; print((json.load(open(sys.argv[1], encoding='utf-8')) or {}).get('bucketAndPrefix','') or '')" "$CONFIG_FILE" 2>/dev/null || true)"
+fi
+ENDPOINT="${WASABI_ENDPOINT:-${_cfg_endpoint:-https://s3.eu-south-1.wasabisys.com}}"
+BUCKET="${BUCKET:-${_cfg_bucket:-mewabackup}}"
 # Retention policy: single source of truth shared with sync-documents.ps1,
 # check-fleet.ps1 and fleet-dashboard.py. Override with RETENTION_FILE=...
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RETENTION_FILE="${RETENTION_FILE:-$SCRIPT_DIR/retention.json}"
 CSV_OUT=""
 DISCOVER=false
@@ -39,9 +49,10 @@ Usage: check-fleet.sh [OPTIONS] [HOSTNAME...]
   --hostnames H1,H2          Same, comma- and/or space-separated.
   --discover                 List repo prefixes via AWS CLI (default when
                              no hostnames are given).
-  --endpoint URL             Wasabi endpoint (default: env WASABI_ENDPOINT
-                             or https://s3.eu-south-1.wasabisys.com).
-  --bucket NAME              Bucket (default: env BUCKET or mewabackup).
+  --endpoint URL             Wasabi endpoint (default: env WASABI_ENDPOINT,
+                             backup-config.json, or the built-in default).
+  --bucket NAME              Bucket (default: env BUCKET,
+                             backup-config.json, or the built-in default).
   --csv PATH                 Also write results as CSV to PATH.
   -h, --help                 Show this help.
 

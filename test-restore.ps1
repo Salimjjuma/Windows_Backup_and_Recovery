@@ -11,11 +11,15 @@
 # =====================================================================
 
 param(
+    # Repository prefix to test. Legacy laptops: COMPUTERNAME.
+    # Per-account laptops: COMPUTERNAME-<account> (e.g. LAPTOP-JSMITH-Acc2).
     [Parameter(Mandatory = $true)]
     [string]$HostName,
 
-    [string]$WasabiEndpoint = "https://s3.eu-south-1.wasabisys.com",
-    [string]$BucketAndPrefix = "mewabackup",
+    # Empty = read from backup-config.json next to this script, then the
+    # built-in default.
+    [string]$WasabiEndpoint = "",
+    [string]$BucketAndPrefix = "",
     [string]$RestoreRoot = "C:\RestoreTests"
 )
 
@@ -27,6 +31,36 @@ $ErrorActionPreference = "Continue"
 # including cases where restic's own diagnostic output is expected, not
 # a real failure.
 $PSNativeCommandUseErrorActionPreference = $false
+
+# ---- Shared endpoint/bucket (backup-config.json) ----
+function Read-BackupConfig {
+    $candidates = @()
+    if ($PSScriptRoot) { $candidates += (Join-Path $PSScriptRoot "backup-config.json") }
+    $candidates += (Join-Path (Get-Location).Path "backup-config.json")
+    foreach ($p in $candidates) {
+        if ($p -and (Test-Path $p)) {
+            try { return Get-Content -Path $p -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+            catch { Write-Warning "Could not read ${p}: $($_.Exception.Message)" }
+        }
+    }
+    return $null
+}
+$BackupConfig = Read-BackupConfig
+if (-not $WasabiEndpoint) {
+    $WasabiEndpoint = if ($BackupConfig -and $BackupConfig.wasabiEndpoint) {
+        "$($BackupConfig.wasabiEndpoint)"
+    } else {
+        "https://s3.eu-south-1.wasabisys.com"
+    }
+}
+if (-not $BucketAndPrefix) {
+    $BucketAndPrefix = if ($BackupConfig -and $BackupConfig.bucketAndPrefix) {
+        "$($BackupConfig.bucketAndPrefix)"
+    } else {
+        "mewabackup"
+    }
+}
+
 $env:RESTIC_REPOSITORY = "s3:$WasabiEndpoint/$BucketAndPrefix/$HostName"
 # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / RESTIC_PASSWORD_FILE
 # are expected to already be set in IT's own environment.

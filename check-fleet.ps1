@@ -14,10 +14,15 @@
 # =====================================================================
 
 param(
+    # Repository prefixes to check. Legacy laptops: COMPUTERNAME. Per-account
+    # laptops: COMPUTERNAME-<account> (e.g. LAPTOP-1-Acc2) — they appear as
+    # separate rows automatically.
     [string[]]$HostNames = @(),
 
-    [string]$WasabiEndpoint = "https://s3.eu-south-1.wasabisys.com",
-    [string]$BucketAndPrefix = "mewabackup"
+    # Empty = read from backup-config.json next to this script, then the
+    # built-in default.
+    [string]$WasabiEndpoint = "",
+    [string]$BucketAndPrefix = ""
 )
 
 $ErrorActionPreference = "Continue"
@@ -26,6 +31,35 @@ $ErrorActionPreference = "Continue"
 # restic writes to stderr gets converted into a terminating exception,
 # bypassing those checks.
 $PSNativeCommandUseErrorActionPreference = $false
+
+# ---- Shared endpoint/bucket (backup-config.json) ----
+function Read-BackupConfig {
+    $candidates = @()
+    if ($PSScriptRoot) { $candidates += (Join-Path $PSScriptRoot "backup-config.json") }
+    $candidates += (Join-Path (Get-Location).Path "backup-config.json")
+    foreach ($p in $candidates) {
+        if ($p -and (Test-Path $p)) {
+            try { return Get-Content -Path $p -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+            catch { Write-Warning "Could not read ${p}: $($_.Exception.Message)" }
+        }
+    }
+    return $null
+}
+$BackupConfig = Read-BackupConfig
+if (-not $WasabiEndpoint) {
+    $WasabiEndpoint = if ($BackupConfig -and $BackupConfig.wasabiEndpoint) {
+        "$($BackupConfig.wasabiEndpoint)"
+    } else {
+        "https://s3.eu-south-1.wasabisys.com"
+    }
+}
+if (-not $BucketAndPrefix) {
+    $BucketAndPrefix = if ($BackupConfig -and $BackupConfig.bucketAndPrefix) {
+        "$($BackupConfig.bucketAndPrefix)"
+    } else {
+        "mewabackup"
+    }
+}
 
 # ---- Preflight ----
 # Drop blank entries so -HostNames "",("PC-1","") etc. fall through to
