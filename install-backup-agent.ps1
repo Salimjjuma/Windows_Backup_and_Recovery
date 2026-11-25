@@ -787,20 +787,84 @@ $settings = New-ScheduledTaskSettingsSet `
 # their Documents/Desktop/Downloads), and survives logoff/lock.
 $principal = New-ScheduledTaskPrincipal -UserId $TaskUser -LogonType S4U -RunLevel Limited
 
+$registeredWithPassword = $false
+$registered = $false
+$regError = ''
 try {
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
         -Settings $settings -Principal $principal -Force -ErrorAction Stop | Out-Null
+    $registered = $true
 } catch {
     $regError = $_.Exception.Message
-    if ($regError -match 'Access is denied|0x80070005') {
+    if ($regError -notmatch 'Access is denied|0x80070005') {
+        throw "Could not register scheduled task '$TaskName': $regError"
+    }
+}
+
+# Step 2: S4U needs the account to hold "Log on as a batch job". Standard
+# users do not by default, but members of Performance Log Users
+# (S-1-5-32-559) do. Add the account to that low-privilege group (looked up
+# by SID so it works on any Windows language) and retry S4U.
+if (-not $registered) {
+    Write-Warning "S4U registration was denied for '$TaskUser' (0x80070005). Adding the account to 'Performance Log Users' (grants 'Log on as a batch job') and retrying."
+    try {
+        $batchGroup = Get-LocalGroup -SID 'S-1-5-32-559' -ErrorAction Stop
+        $alreadyMember = $false
+        $memberSid = if ($TaskUserSid) { $TaskUserSid } else { Get-AccountSid -Identity $TaskUser }
+        try {
+            $alreadyMember = [bool](Get-LocalGroupMember -Group $batchGroup -ErrorAction Stop |
+                Where-Object { $_.SID.Value -eq $memberSid })
+        } catch { }
+        if ($alreadyMember) {
+            Write-Host "'$TaskUser' is already a member of '$($batchGroup.Name)'."
+        } else {
+            try {
+                Add-LocalGroupMember -Group $batchGroup -Member $TaskUser -ErrorAction Stop
+                Write-Host "Added '$TaskUser' to '$($batchGroup.Name)'."
+            } catch [Microsoft.PowerShell.Commands.MemberExistsException] {
+                Write-Host "'$TaskUser' is already a member of '$($batchGroup.Name)'."
+            }
+        }
+        Start-Sleep -Seconds 2
+        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+            -Settings $settings -Principal $principal -Force -ErrorAction Stop | Out-Null
+        $registered = $true
+    } catch {
+        $regError = "$regError | retry after group grant: $($_.Exception.Message)"
+        Write-Warning "S4U retry did not succeed: $($_.Exception.Message)"
+    }
+}
+
+# Step 3: last resort - stored-password task. Ask for the TARGET account's
+# password and let Task Scheduler keep it.
+if (-not $registered) {
+    Write-Warning "Falling back to a stored-password task for '$TaskUser'."
+    Write-Host "Enter the Windows password of '$TaskUser' (the account the backup runs as)."
+    $secPwd = Read-Host "Password for $TaskUser" -AsSecureString
+    $plainPwd = [System.Net.NetworkCredential]::new('', $secPwd).Password
+    if ([string]::IsNullOrEmpty($plainPwd)) {
+        throw "No password entered. A stored-password task cannot be created for '$TaskUser' without one."
+    }
+    try {
+        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+            -Settings $settings -User $TaskUser -Password $plainPwd -RunLevel Limited `
+            -Force -ErrorAction Stop | Out-Null
+        $registered = $true
+        $registeredWithPassword = $true
+    } catch {
         $who = 'unknown'
         try { $who = "$(whoami)" } catch { }
-        throw "Task Scheduler denied registration of '$TaskName' for '$TaskUser' (0x80070005 Access is denied). This task runs whether-or-not-logged-on (S4U) in the root task folder, which needs a full administrator token and a valid, enabled target account. Current identity: $who. Confirm 'whoami /groups' lists BUILTIN\Administrators, that the account '$TaskUser' can log on, and see the TaskScheduler operational log if it still fails."
+        throw "Could not register '$TaskName' for '$TaskUser' with a stored password either: $($_.Exception.Message) (S4U error was: $regError). Current identity: $who. Check the password is correct and the account is enabled."
+    } finally {
+        $plainPwd = $null
+        $secPwd = $null
     }
-    throw "Could not register scheduled task '$TaskName': $regError"
 }
 
 Write-Host "Scheduled task '$TaskName' registered (starts at logon, auto-restarts)."
+if ($registeredWithPassword) {
+    Write-Host "Note: this task uses a stored password for $TaskUser. If that account's password changes, re-run the installer to update the task."
+}
 
 # ---- 8. Start it now and confirm it actually launched ----
 Show-InstallProgress -Step 8 -Status "Starting backup task"
@@ -829,6 +893,8 @@ if ($taskState -ne 'Running') {
     $hint = switch ("$result") {
         '2147942405' { 'Access is denied - the account cannot read the deployed script, config dir or restic password.' }
         '2147943726' { 'Logon failure - S4U could not create a token for this account (blank password or policy).' }
+        '2147943721' { 'The account has not been granted the requested logon type (add it to Log on as a batch job) or the stored password is wrong.' }
+        '2147943571' { 'Logon failure - wrong stored password or the account cannot log on.' }
         '267011'     { 'The task has not run yet - check the trigger and Start-ScheduledTask result.' }
         default      { 'See sync.log and the Task Scheduler history for details.' }
     }
