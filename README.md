@@ -105,7 +105,13 @@ same file also carries the `excludes` list that seeds each agent's
    # powershell -ExecutionPolicy Bypass -File install-backup-agent.ps1 -PerAccount -TaskUser "$env:COMPUTERNAME\Acc2"
 ```
 3. It will prompt to elevate (accept the UAC prompt) if not already
-   running as admin.
+   running as admin. Elevation is mandatory: creating the scheduled task
+   needs a full administrator token. If UAC is cancelled the installer now
+   stops before changing anything (previously it could run through repo
+   init and then fail with `Register-ScheduledTask : Access is denied`
+   / `0x80070005`). If you see that error, re-run from PowerShell opened
+   with **Run as administrator** — it is safe to re-run (existing
+   keys/password and repository are reused).
 4. When prompted, enter:
    - **Wasabi Access Key ID**
    - **Wasabi Secret Access Key**

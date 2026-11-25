@@ -179,6 +179,24 @@ function Stop-AgentWatcher {
     return $stopped
 }
 
+# Restores a file's inherited ACL. A previous non-elevated run can leave a
+# file owned by the task account with a read-only DACL; Administrators then
+# cannot change it until they take ownership, so fall back to takeown.
+function Reset-FileAcl {
+    param([string]$Path)
+    & icacls $Path /reset | Out-Null
+    if ($LASTEXITCODE -eq 0) { return }
+    Write-Warning "Could not reset the ACL on $Path (it may be owned by another account); taking ownership first."
+    & takeown /f $Path /a | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not take ownership of $Path (takeown exit code $LASTEXITCODE). Delete the file manually and re-run."
+    }
+    & icacls $Path /reset | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not reset the ACL on $Path even after taking ownership (icacls exit code $LASTEXITCODE)."
+    }
+}
+
 # ---- Re-launch elevated if not already admin ----
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
@@ -193,8 +211,21 @@ if (-not $isAdmin) {
     if ($RotateRepositoryPassword) { $fwdArgs += " -RotateRepositoryPassword" }
     if ($WasabiEndpoint) { $fwdArgs += " -WasabiEndpoint `"$WasabiEndpoint`"" }
     if ($BucketAndPrefix) { $fwdArgs += " -BucketAndPrefix `"$BucketAndPrefix`"" }
-    Start-Process powershell -Verb RunAs -ArgumentList $fwdArgs
+    try {
+        Start-Process powershell -Verb RunAs -ArgumentList $fwdArgs -ErrorAction Stop
+    } catch {
+        throw "Could not relaunch elevated: $($_.Exception.Message) Right-click PowerShell and choose 'Run as administrator' with an administrator account, then re-run this script. Nothing has been changed."
+    }
     exit
+}
+
+# Belt-and-braces: if the relaunch above somehow produced a non-elevated
+# process, stop before touching machine state. Otherwise the first symptom
+# would be a much later "Access is denied" from Task Scheduler or the
+# machine environment registry.
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    throw "This installer must run elevated. Right-click PowerShell, choose 'Run as administrator' (with an administrator account), and run it again. Nothing has been changed."
 }
 
 # ---- Resolve the account, backup ID, directories and task name ----
@@ -524,10 +555,7 @@ Show-InstallProgress -Step 3 -Status "Securing repository password"
 # script is safe to re-run.
 Write-Host "Scheduled task will run as: $TaskUser"
 if (Test-Path -LiteralPath $PasswordFile) {
-    & icacls $PasswordFile /reset | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not reset the ACL on $PasswordFile (icacls exit code $LASTEXITCODE)."
-    }
+    Reset-FileAcl -Path $PasswordFile
 }
 Set-Content -Path $PasswordFile -Value $newPassword -NoNewline -ErrorAction Stop
 & icacls $PasswordFile /inheritance:r | Out-Null
@@ -575,9 +603,25 @@ if ($PerAccount) {
 
 # ---- 4. Set machine-wide environment variables restic needs ----
 Show-InstallProgress -Step 4 -Status "Setting environment variables"
-[Environment]::SetEnvironmentVariable("AWS_ACCESS_KEY_ID", $AccessKey, "Machine")
-[Environment]::SetEnvironmentVariable("AWS_SECRET_ACCESS_KEY", $SecretKey, "Machine")
-[Environment]::SetEnvironmentVariable("RESTIC_PASSWORD_FILE", $PasswordFile, "Machine")
+# .NET method failures are non-terminating, so a non-elevated run would print
+# a red registry error and then keep going. Set, read back, and stop if the
+# value did not persist - otherwise the agent fails later with no credentials.
+$machineEnv = [ordered]@{
+    AWS_ACCESS_KEY_ID     = $AccessKey
+    AWS_SECRET_ACCESS_KEY = $SecretKey
+    RESTIC_PASSWORD_FILE  = $PasswordFile
+}
+foreach ($name in $machineEnv.Keys) {
+    try {
+        [Environment]::SetEnvironmentVariable($name, $machineEnv[$name], "Machine")
+    } catch {
+        throw "Could not set machine environment variable ${name}: $($_.Exception.Message). Re-run from an elevated PowerShell session."
+    }
+    $actual = [Environment]::GetEnvironmentVariable($name, "Machine")
+    if ($actual -ne $machineEnv[$name]) {
+        throw "Machine environment variable $name did not persist (read back '$actual'). The script is not running with administrator rights - re-run from an elevated PowerShell session."
+    }
+}
 
 if ($PerAccount) {
     # Do not clobber a legacy machine-wide repo: the original single-account
@@ -586,10 +630,18 @@ if ($PerAccount) {
     # for manual `restic` use when nothing is set yet.
     $existingRepo = [Environment]::GetEnvironmentVariable("RESTIC_REPOSITORY", "Machine")
     if (-not $existingRepo) {
-        [Environment]::SetEnvironmentVariable("RESTIC_REPOSITORY", $Repository, "Machine")
+        try { [Environment]::SetEnvironmentVariable("RESTIC_REPOSITORY", $Repository, "Machine") } catch {
+            throw "Could not set machine environment variable RESTIC_REPOSITORY: $($_.Exception.Message)"
+        }
     }
 } else {
-    [Environment]::SetEnvironmentVariable("RESTIC_REPOSITORY", $Repository, "Machine")
+    try { [Environment]::SetEnvironmentVariable("RESTIC_REPOSITORY", $Repository, "Machine") } catch {
+        throw "Could not set machine environment variable RESTIC_REPOSITORY: $($_.Exception.Message)"
+    }
+    $repoActual = [Environment]::GetEnvironmentVariable("RESTIC_REPOSITORY", "Machine")
+    if ($repoActual -ne $Repository) {
+        throw "Machine environment variable RESTIC_REPOSITORY did not persist (read back '$repoActual'). Re-run from an elevated PowerShell session."
+    }
 }
 
 # Also set for this session so init/checks below work immediately
@@ -735,8 +787,18 @@ $settings = New-ScheduledTaskSettingsSet `
 # their Documents/Desktop/Downloads), and survives logoff/lock.
 $principal = New-ScheduledTaskPrincipal -UserId $TaskUser -LogonType S4U -RunLevel Limited
 
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-    -Settings $settings -Principal $principal -Force -ErrorAction Stop | Out-Null
+try {
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+        -Settings $settings -Principal $principal -Force -ErrorAction Stop | Out-Null
+} catch {
+    $regError = $_.Exception.Message
+    if ($regError -match 'Access is denied|0x80070005') {
+        $who = 'unknown'
+        try { $who = "$(whoami)" } catch { }
+        throw "Task Scheduler denied registration of '$TaskName' for '$TaskUser' (0x80070005 Access is denied). This task runs whether-or-not-logged-on (S4U) in the root task folder, which needs a full administrator token and a valid, enabled target account. Current identity: $who. Confirm 'whoami /groups' lists BUILTIN\Administrators, that the account '$TaskUser' can log on, and see the TaskScheduler operational log if it still fails."
+    }
+    throw "Could not register scheduled task '$TaskName': $regError"
+}
 
 Write-Host "Scheduled task '$TaskName' registered (starts at logon, auto-restarts)."
 

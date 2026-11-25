@@ -268,3 +268,54 @@ The fix grants read to SYSTEM, Administrators and **all** configured backup
 task users, then restarts every backup task (and exits 1 if one does not come
 back up), so it is safe to run on a per-account machine without locking
 another account out. Confirm with `verify-backup-agent.ps1` afterwards.
+
+The script also takes ownership (`takeown /f ... /a`) and retries if
+`icacls` is refused, which is what happens when an earlier install ran
+without elevation and left `restic-password.txt` owned by the task account.
+
+## 11. Fix: `Register-ScheduledTask : Access is denied` on install
+
+Symptom: the installer gets through restic/password/config deployment, then
+stops at:
+
+```
+Register-ScheduledTask : Access is denied.
+FullyQualifiedErrorId : HRESULT 0x80070005,Register-ScheduledTask
+```
+
+Cause: the script was started from a non-elevated PowerShell (or via an
+account that is not an administrator). Task Scheduler refuses to create a
+task that runs whether-or-not-logged-on (S4U) in the root task folder
+without a full administrator token. The `Relaunching as Administrator...`
+path only works if that administrator prompt is accepted; if it is
+cancelled or UAC is unavailable, the original non-elevated process keeps
+running.
+
+Fix: open PowerShell with **Run as administrator**, then re-run the same
+command:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1 -PerAccount -TaskUser "$env:COMPUTERNAME\test"
+```
+
+A re-run is safe and expected: at the key/password prompts press Enter to
+keep the existing values, the repository already exists so `restic init` is
+skipped, and the deployed files are simply replaced. Current builds abort at
+startup if elevation is missing and read back the machine environment
+variables, so this failure now happens before anything is changed.
+
+If it still fails when elevated, collect:
+
+```powershell
+whoami /groups | findstr /i "S-1-5-32-544"
+whoami /priv | findstr /i "SeTcbPrivilege SeTakeOwnershipPrivilege"
+Get-ScheduledTask -TaskName "DocumentsBackupSync-test" -ErrorAction SilentlyContinue
+# Task Scheduler operational log, last 20 events:
+Get-WinEvent -LogName Microsoft-Windows-TaskScheduler/Operational -MaxEvents 20 |
+    Where-Object { $_.Id -in 101,102,103,104,111,201 } | Format-List TimeCreated, Id, Message
+```
+
+Also confirm the task account is a real, enabled local account with a
+loaded profile (`Test-Path "$env:SystemDrive\Users\test"`), and that the
+account can be used for a scheduled task (blank-password accounts are
+restricted by policy).

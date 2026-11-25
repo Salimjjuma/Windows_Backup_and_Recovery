@@ -33,8 +33,19 @@ if (-not $isAdmin) {
     Write-Host "Relaunching as Administrator..."
     $fwd = "-ExecutionPolicy Bypass -File `"$PSCommandPath`""
     if ($TaskName) { $fwd += " -TaskName `"$TaskName`"" }
-    Start-Process powershell -Verb RunAs -ArgumentList $fwd
+    try {
+        Start-Process powershell -Verb RunAs -ArgumentList $fwd -ErrorAction Stop
+    } catch {
+        throw "Could not relaunch elevated: $($_.Exception.Message) Right-click PowerShell, choose 'Run as administrator', and re-run. Nothing has been changed."
+    }
     exit
+}
+
+# If the elevation prompt was dismissed, do not continue: the ACL repair and
+# the task restart both need administrator rights and would fail quietly.
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    throw "This script must run elevated. Right-click PowerShell, choose 'Run as administrator', and run it again. Nothing has been changed."
 }
 
 $PasswordFile = "$env:ProgramData\DocBackup\restic-password.txt"
@@ -119,15 +130,27 @@ foreach ($id in $grantIdentities) {
 Write-Host "Backup tasks found: $($allTasks.TaskName -join ', ')"
 Write-Host "Granting read on $PasswordFile to: $($uniqueIds -join ', ')"
 
-& icacls $PasswordFile /inheritance:r | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    throw "icacls failed to disable inheritance on $PasswordFile (exit code $LASTEXITCODE)."
+# A previous non-elevated install can leave the file owned by the task account
+# with a read-only DACL. Administrators then cannot change it until they take
+# ownership, so retry the ACL change after takeown.
+function Invoke-IcaclsChecked {
+    param([string]$Path, [string[]]$Arguments, [string]$What)
+    & icacls @(@($Path) + $Arguments) | Out-Null
+    if ($LASTEXITCODE -eq 0) { return }
+    Write-Host "Could not $What (the file may be owned by another account); taking ownership first."
+    & takeown /f $Path /a | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not take ownership of $Path (takeown exit code $LASTEXITCODE)."
+    }
+    & icacls @(@($Path) + $Arguments) | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not $What on $Path (icacls exit code $LASTEXITCODE). Nothing was fixed."
+    }
 }
-$aclArgs = @($PasswordFile, "/grant:r") + @($uniqueIds | ForEach-Object { "${_}:(R)" })
-& icacls @aclArgs | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    throw "icacls failed to grant read access on $PasswordFile (exit code $LASTEXITCODE). Nothing was fixed."
-}
+
+Invoke-IcaclsChecked -Path $PasswordFile -Arguments @('/inheritance:r') -What 'disable inheritance'
+$aclArgs = @('/grant:r') + @($uniqueIds | ForEach-Object { "${_}:(R)" })
+Invoke-IcaclsChecked -Path $PasswordFile -Arguments $aclArgs -What 'grant read access'
 
 Write-Host "Permissions fixed. Current ACL:"
 & icacls $PasswordFile

@@ -63,8 +63,19 @@ if (-not $isAdmin) {
     elseif ($TaskName -ne "DocumentsBackupSync") { $fwdArgs += " -TaskName `"$TaskName`"" }
     if (-not $Account -and $ConfigDir -ne $BaseConfigDir) { $fwdArgs += " -ConfigDir `"$ConfigDir`"" }
     if ($Full) { $fwdArgs += " -Full" }
-    Start-Process powershell -Verb RunAs -ArgumentList $fwdArgs
+    try {
+        Start-Process powershell -Verb RunAs -ArgumentList $fwdArgs -ErrorAction Stop
+    } catch {
+        throw "Could not relaunch elevated: $($_.Exception.Message) Right-click PowerShell, choose 'Run as administrator', and re-run. Nothing has been changed."
+    }
     exit
+}
+
+# If the elevation prompt was dismissed, do not continue and pretend the
+# cleanup succeeded: machine env vars and the password file need admin.
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    throw "This uninstaller must run elevated. Right-click PowerShell, choose 'Run as administrator', and run it again. Nothing has been changed."
 }
 
 Write-Host ""
@@ -129,14 +140,22 @@ if ($remainingTasks.Count -eq 0) {
     if (Test-Path -LiteralPath $PasswordFile) {
         # The file is ACL'd read-only for SYSTEM/Administrators/task users
         # with inheritance disabled, so take rights back before deleting.
-        # SIDs, not localised group names.
+        # SIDs, not localised group names. Best effort: an install that ran
+        # without elevation can leave the file owned by the task account, and
+        # only takeown can recover from that.
         & icacls $PasswordFile /reset 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Password file is owned by another account; taking ownership before cleanup."
+            & takeown /f $PasswordFile /a 2>$null | Out-Null
+            & icacls $PasswordFile /reset 2>$null | Out-Null
+        }
         & icacls $PasswordFile /grant:r "*S-1-5-32-544:(F)" "*S-1-5-18:(F)" 2>$null | Out-Null
         try {
             Remove-Item -Path $PasswordFile -Force -ErrorAction Stop
             Write-Host "Password file deleted: $PasswordFile"
         } catch {
             Write-Host "Could not delete password file ${PasswordFile}: $_"
+            Write-Host "Delete it manually as an administrator, or run: takeown /f `"$PasswordFile`" /a"
         }
     }
 } else {
