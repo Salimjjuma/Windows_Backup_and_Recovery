@@ -61,6 +61,17 @@ if (-not $BucketAndPrefix) {
     }
 }
 
+$WasabiEndpoint = "$WasabiEndpoint".Trim().TrimEnd('/')
+$BucketAndPrefix = "$BucketAndPrefix".Trim().TrimEnd('/')
+if (-not $WasabiEndpoint -or -not $BucketAndPrefix) {
+    throw "Wasabi endpoint and bucket must not be empty."
+}
+# The fleet tools discover repositories as top-level prefixes inside the
+# bucket, so a bucket path like "bucket/prefix" cannot be represented.
+if ($BucketAndPrefix.Contains('/')) {
+    throw "bucketAndPrefix must be a bucket name only (found '$BucketAndPrefix'). Configure a bucket, not a bucket/prefix path."
+}
+
 # ---- Preflight ----
 # Drop blank entries so -HostNames "",("PC-1","") etc. fall through to
 # discovery (or the empty-repo error) instead of querying a garbage path.
@@ -108,7 +119,7 @@ try {
 }
 Write-Host "Retention policy: keep-daily $KeepDaily, keep-weekly $KeepWeekly, keep-monthly $KeepMonthly"
 
-$Bucket = ($BucketAndPrefix -split "/")[0]
+$Bucket = $BucketAndPrefix
 $SavedRepo = $env:RESTIC_REPOSITORY
 
 # ---- Discover laptop prefixes if none were passed ----

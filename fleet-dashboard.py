@@ -84,9 +84,50 @@ def load_config():
     return cfg
 
 
+def _atomic_write_json(path, obj):
+    """Write JSON to a temp file and rename it into place.
+
+    The laptop installer may read backup-config.json at the same moment an
+    admin saves the dashboard config; a plain truncate-and-write would expose
+    half-written JSON and make the installer refuse to run.
+    """
+    tmp = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+def clean_endpoint(value):
+    endpoint = str(value or "").strip().rstrip("/")
+    if not endpoint:
+        raise ValueError("Wasabi endpoint must not be empty.")
+    return endpoint
+
+
+def clean_bucket(value):
+    bucket = str(value or "").strip().rstrip("/")
+    if not bucket:
+        raise ValueError("Bucket must not be empty.")
+    if "/" in bucket:
+        raise ValueError(
+            "Bucket must be a bucket name only (no '/'). The fleet tools "
+            "discover repositories as top-level prefixes inside the bucket.")
+    return bucket
+
+
 def save_config(cfg):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    cfg["endpoint"] = clean_endpoint(cfg.get("endpoint"))
+    cfg["bucket"] = clean_bucket(cfg.get("bucket"))
+    _atomic_write_json(CONFIG_FILE, cfg)
     # Keep endpoint/bucket synchronised into the shared config so the laptop
     # installer/agent and the other fleet tools see the same values.
     shared = {}
@@ -98,8 +139,7 @@ def save_config(cfg):
     shared["wasabiEndpoint"] = cfg["endpoint"]
     shared["bucketAndPrefix"] = cfg["bucket"]
     try:
-        with open(BACKUP_CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(shared, f, indent=2)
+        _atomic_write_json(BACKUP_CONFIG_FILE, shared)
     except OSError:
         pass
 
@@ -285,6 +325,8 @@ def check_one(hostname, endpoint, bucket):
 
 
 def discover(endpoint, bucket):
+    endpoint = clean_endpoint(endpoint)
+    bucket = clean_bucket(bucket)
     code, out, err = run_cmd(["aws", "s3api", "list-objects-v2",
                               "--bucket", bucket, "--delimiter", "/",
                               "--endpoint-url", endpoint,
@@ -293,7 +335,11 @@ def discover(endpoint, bucket):
     if code != 0:
         raise RuntimeError(
             f"bucket listing failed: {err_tail(err, 500) or f'aws exited with code {code}'}")
-    prefixes = json.loads(out or "[]") or []
+    try:
+        prefixes = json.loads(out or "[]") or []
+    except json.JSONDecodeError:
+        raise RuntimeError(
+            f"could not parse bucket listing as JSON: {err_tail(out, 500)}")
     return sorted(p.rstrip("/") for p in prefixes if p and p.rstrip("/"))
 
 
@@ -762,14 +808,17 @@ class Handler(BaseHTTPRequestHandler):
             sh = data.get("stale_hours")
             if isinstance(sh, (int, float)) and 1 <= sh <= 720:
                 cfg["stale_hours"] = int(sh)
-            save_config(cfg)
+            try:
+                save_config(cfg)
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
             return self._json({"saved": True})
         if url.path == "/api/discover":
             cfg = load_config()
             if not shutil.which("aws"):
                 return self._json({"error": "AWS CLI not found on server"}, 500)
             try:
-                names = discover(cfg["endpoint"], cfg["bucket"].split("/")[0])
+                names = discover(cfg["endpoint"], cfg["bucket"])
             except Exception as e:  # noqa: BLE001 - surfaced to UI
                 return self._json({"error": str(e)}, 500)
             return self._json({"hostnames": names})

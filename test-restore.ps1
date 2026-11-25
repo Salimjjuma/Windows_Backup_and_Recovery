@@ -61,6 +61,15 @@ if (-not $BucketAndPrefix) {
     }
 }
 
+$WasabiEndpoint = "$WasabiEndpoint".Trim().TrimEnd('/')
+$BucketAndPrefix = "$BucketAndPrefix".Trim().TrimEnd('/')
+if (-not $WasabiEndpoint -or -not $BucketAndPrefix) {
+    throw "Wasabi endpoint and bucket must not be empty."
+}
+if ($BucketAndPrefix -match '/') {
+    throw "bucketAndPrefix must be a bucket name only (found '$BucketAndPrefix'). The fleet tools discover repositories as top-level prefixes inside the bucket."
+}
+
 $env:RESTIC_REPOSITORY = "s3:$WasabiEndpoint/$BucketAndPrefix/$HostName"
 # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / RESTIC_PASSWORD_FILE
 # are expected to already be set in IT's own environment.

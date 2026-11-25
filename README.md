@@ -25,6 +25,7 @@ repository stored in a Wasabi S3 bucket.
 | `install-backup-agent.ps1` | One-time setup script. Installs restic, provisions the repo, deploys the watcher, registers the scheduled task. |
 | `backup-config.json` | Shared endpoint, bucket/prefix and exclude patterns. Read by the installer, the agent and every fleet tool, so they cannot drift apart. |
 | `test-restore.ps1` | Run centrally by IT (not on laptops). Restores a snapshot to verify backups are actually recoverable. |
+| `verify-backup-agent.ps1` | Read-only health check on a laptop: task state/principal, deployed files, password ACLs, log contents, config, repository and snapshots. Exit code 1 on failure. |
 
 **Encryption:** restic encrypts all data with AES-256 in counter mode
 (AES-256-CTR), combined with Poly1305 for integrity verification, by
@@ -167,25 +168,50 @@ independently and survive lock/logoff.
 
 Notes:
 
+- **`-TaskUser` is mandatory with `-PerAccount`.** Auto-detection prefers the
+  console user, so an administrator who elevates to install somebody else's
+  agent would silently register their own account. The installer refuses to
+  run per-account mode without an explicit `COMPUTER\account`, and verifies
+  that the account's profile already exists.
 - **Log in as the second account once** before provisioning it, so its
   profile and Desktop exist. After that the agent runs in the background;
-  you do not need to keep that account logged in.
+  you do not need to keep that account logged in. If the profile is missing
+  the installer aborts; if the folders disappear later the agent logs a
+  `FATAL: no existing source paths` line and stops instead of backing up
+  nothing.
 - Installing the second account reuses the machine's saved credentials:
   the prompts show `[Enter to keep existing]` for the Wasabi keys and the
   restic password. Pressing Enter keeps them, so both accounts share the
   same bucket keys and repository password (as intended).
+- **Changing the shared restic password is blocked by default.** Overwriting
+  `restic-password.txt` does *not* rekey existing repositories — it makes
+  every repo that still uses the old key unreadable. The installer refuses
+  to replace an existing password unless `-RotateRepositoryPassword` is
+  passed, and even then only after you have run `restic key add` on every
+  repository (see §6).
+- Changing the shared Wasabi keys asks for an explicit `YES` confirmation,
+  because running agents keep the old keys until restarted and a typo would
+  break their next backup.
 - Re-running the installer for one account only touches that account's
-  task/repository and preserves the others' password-file access.
+  task/repository. It stops the old task, terminates any orphaned watcher
+  process, re-registers, starts the task and then verifies it is actually
+  running before reporting success. It also preserves the other accounts'
+  password-file access. If an existing task with the same name runs as a
+  different account (e.g. `Acc 2` and `Acc-2` sanitise to the same name),
+  the install aborts rather than overwrite it.
 - Each account has its **own** `excludes.txt`, `extra-paths.txt`,
   `retention.json` and `last-prune.txt` under
-  `Accounts\<account>\`; changing one does not affect the other.
+  `Accounts\<account>\`; changing one does not affect the other. The
+  deployed `backup-config.json` is also per account, and is re-written from
+  the installer's resolved values on every run.
 - `restic snapshots` and the fleet tools see the two repos as separate
   entries (`LAPTOP-1-Acc1`, `LAPTOP-1-Acc2`), so restore testing is per
   account: `test-restore.ps1 -HostName LAPTOP-1-Acc2`.
-- Default mode and per-account mode can coexist on a machine during a
-  migration: the legacy `DocumentsBackupSync` task keeps using
-  `bucket\COMPUTERNAME`, while `DocumentsBackupSync-Acc2` uses
-  `bucket\COMPUTERNAME-Acc2`.
+- **Legacy and per-account mode must not be mixed on one machine.** The
+  installer refuses a default (per-laptop) install when
+  `DocumentsBackupSync-*` tasks already exist, because it would back up the
+  console user's files a second time under `COMPUTERNAME`. During migration,
+  remove the legacy agent with `uninstall-backup-agent.ps1` first.
 - To remove one account without disturbing the other, use
   `uninstall-backup-agent.ps1 -Account Acc2` (see §8). Shared secrets and
   `restic.exe` are only removed when no backup task remains.
@@ -231,7 +257,27 @@ Once installed, no user action is required. Mechanically:
 ## 5. Verifying a laptop after install
 
 Don't consider a laptop provisioned until you've confirmed backups are
-actually landing remotely:
+actually landing remotely. Run the read-only verifier first — it checks the
+task state and principal, deployed files, password-file ACLs, log contents,
+config values and (unless `-SkipRepositoryCheck` is passed) that the
+repository answers restic and holds snapshots:
+
+```powershell
+# Every backup task on this machine (legacy + per-account)
+powershell -ExecutionPolicy Bypass -File .\verify-backup-agent.ps1
+
+# One account only
+powershell -ExecutionPolicy Bypass -File .\verify-backup-agent.ps1 -TaskName DocumentsBackupSync-Acc2
+
+# Offline / no Wasabi access: skip the restic calls
+powershell -ExecutionPolicy Bypass -File .\verify-backup-agent.ps1 -SkipRepositoryCheck
+```
+
+It prints one `[PASS]`/`[WARN]`/`[FAIL]` line per check, a summary, and
+returns exit code 1 if any check failed (useful for scripting the rollout).
+It never changes anything: no tasks are started, no files are written.
+
+To confirm by hand as well:
 
 ```powershell
 # On the laptop, or remotely with the right env vars set:
@@ -272,6 +318,23 @@ Someone who obtains only the Wasabi keys can see that encrypted blobs
 exist and could delete or overwrite them, but **cannot read the contents**
 without the restic password. Treat the restic password as the more
 sensitive of the two.
+
+**Rotating the restic repository password** (only if it was exposed):
+overwriting `restic-password.txt` alone does **not** rekey anything — every
+repository still expects the old key, so the agents would fail with
+"wrong password". The safe order is:
+
+1. Run `restic key add` on **every** repository (legacy and each account),
+   entering the new password when prompted. The old key remains valid.
+2. Update `restic-password.txt` on every laptop, using
+   `install-backup-agent.ps1 -RotateRepositoryPassword` (which otherwise
+   refuses to replace an existing password). Then restart each backup task.
+3. Confirm with `verify-backup-agent.ps1` on each machine.
+4. Once every laptop and restore test uses the new key, remove the old key
+   with `restic key remove` on each repository.
+
+Keep the old password escrowed until step 4 is complete; without it the
+repositories cannot be opened.
 
 **If a laptop is lost or stolen:**
 1. Rotate the Wasabi Access Key used by that laptop's install (or the
@@ -372,9 +435,21 @@ python fleet-dashboard.py
 
 **Re-run install on a laptop already provisioned** (e.g. to update the
 watcher script version): safe to do — `restic init` is skipped if the
-repository already exists, and the Scheduled Task is unregistered and
-recreated cleanly. A re-run only affects the account you pass with
-`-TaskUser` (and `-PerAccount`).
+repository already exists, and the existing Scheduled Task is stopped, its
+orphaned watcher process is terminated, and the task is recreated and
+started. The installer then verifies the task is Running and aborts if it
+is not. A re-run only affects the account you pass with `-TaskUser` (and
+`-PerAccount`). Finish with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\verify-backup-agent.ps1 -TaskName DocumentsBackupSync-Acc2
+```
+
+**Check every agent's health (read-only, safe to script):**
+```powershell
+powershell -ExecutionPolicy Bypass -File .\verify-backup-agent.ps1
+# Exit code 1 means at least one [FAIL]; see its output for the fix.
+```
 
 **Repair password-file access** (`Resolving password failed ... Access is
 denied` in `sync.log`):
@@ -451,6 +526,7 @@ purged).
 | `sync-documents.ps1` | Each staff laptop (continuously, via Scheduled Task) | Watches + backs up + prunes that account's/laptop's repo |
 | `uninstall-backup-agent.ps1` | Each staff laptop (on demand) | Removes one agent (`-Account <name>`) or the legacy agent; keeps shared secrets while other agents remain |
 | `fix-password-file-access.ps1` | Each staff laptop (on demand) | Repairs `restic-password.txt` read access for all backup task users and restarts them |
+| `verify-backup-agent.ps1` | Each staff laptop (after install / on demand) | Read-only health check: task, principal, files, ACLs, log, config, repository, snapshots; exit 1 on failure |
 | `backup-config.json` | Repo root + each laptop/account (`C:\ProgramData\DocBackup\` or `...\Accounts\<account>\`) | Single source of endpoint/bucket + exclude patterns, read by every script |
 | `test-restore.ps1` | IT admin machine (on a schedule) | Restoration/integrity testing per repository (laptop or account) |
 | `check-fleet.ps1` | IT admin machine (on demand) | Lists every laptop/account repo: name, snapshot count, latest time, size, prune backlog |

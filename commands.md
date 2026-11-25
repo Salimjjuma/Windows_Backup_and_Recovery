@@ -24,10 +24,20 @@ powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1 -ExtraPaths 
 powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1 -ExtraPaths "C:\Users\Public","D:\Work"
 
 # Re-run (e.g. deploy a new watcher version, or add -ExtraPaths).
-# Saved keys/password are offered as [Enter to keep] — type only to rotate.
-# restic init is skipped if the repo exists; task is recreated cleanly.
+# Saved keys/password are offered as [Enter to keep]; a changed password is
+# REJECTED unless -RotateRepositoryPassword is passed (overwriting the file
+# does not rekey existing repos). The old task is stopped, an orphaned
+# watcher is killed, and the new task is started and verified.
 powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1
+
+# Only during a planned password rotation (run `restic key add` on every repo first)
+powershell -ExecutionPolicy Bypass -File .\install-backup-agent.ps1 -RotateRepositoryPassword
 ```
+
+Note: `-PerAccount` requires `-TaskUser`. A default (legacy) install is
+refused on a machine that already has `DocumentsBackupSync-*` tasks, to
+avoid a second agent backing up the console user's files under
+`COMPUTERNAME`.
 
 What install does: restic → `C:\Program Files\restic`, password → `C:\ProgramData\DocBackup\restic-password.txt` (ACL'd; read access granted to every configured backup task user), machine env vars, `restic init`, watcher → `C:\ProgramData\DocBackup\sync-documents.ps1`, shared config → `C:\ProgramData\DocBackup\backup-config.json`, retention policy → `C:\ProgramData\DocBackup\retention.json` (kept if already present), task `DocumentsBackupSync` (logon trigger, auto-restart), starts it.
 
@@ -36,6 +46,11 @@ With `-PerAccount`, the same steps use `COMPUTERNAME-<account>` as the repo/tag,
 ## 2. Verify after install (laptop)
 
 ```powershell
+# Automated read-only health check (recommended). Exit code 1 = a [FAIL].
+powershell -ExecutionPolicy Bypass -File .\verify-backup-agent.ps1
+powershell -ExecutionPolicy Bypass -File .\verify-backup-agent.ps1 -TaskName DocumentsBackupSync-Acc2
+powershell -ExecutionPolicy Bypass -File .\verify-backup-agent.ps1 -SkipRepositoryCheck   # no network
+
 # Default / legacy
 restic snapshots
 Get-ScheduledTask -TaskName DocumentsBackupSync
@@ -51,7 +66,10 @@ Get-Content C:\ProgramData\DocBackup\Accounts\Acc2\sync.log -Tail 50
 ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole("Administrator")
 ```
 
-Expect: ≥1 snapshot, task `Ready/Running`, log shows `Backup completed successfully`.
+Expect: ≥1 snapshot, task `Running`, log shows `Backup completed successfully`,
+`verify-backup-agent.ps1` prints `RESULT: PASS`. The literal endpoint/bucket in
+the commands above are the defaults; if `backup-config.json` has other values,
+substitute those.
 
 ## 3. Extra backup folders (laptop, any time after install)
 
@@ -247,5 +265,6 @@ powershell -ExecutionPolicy Bypass -File .\fix-password-file-access.ps1
 ```
 
 The fix grants read to SYSTEM, Administrators and **all** configured backup
-task users, then restarts every backup task, so it is safe to run on a
-per-account machine without locking another account out.
+task users, then restarts every backup task (and exits 1 if one does not come
+back up), so it is safe to run on a per-account machine without locking
+another account out. Confirm with `verify-backup-agent.ps1` afterwards.

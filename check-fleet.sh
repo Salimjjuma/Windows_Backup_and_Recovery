@@ -91,6 +91,21 @@ while (($# > 0)); do
     esac
 done
 
+# Trim and validate. The fleet tools discover repos as top-level prefixes in
+# the bucket, so a bucket/prefix path cannot be represented.
+ENDPOINT="${ENDPOINT%"${ENDPOINT##*[![:space:]]}"}"
+BUCKET="${BUCKET%"${BUCKET##*[![:space:]]}"}"
+ENDPOINT="${ENDPOINT%/}"
+BUCKET="${BUCKET%/}"
+if [[ -z "$ENDPOINT" || -z "$BUCKET" ]]; then
+    echo "ERROR: endpoint and bucket must not be empty." >&2
+    exit 2
+fi
+if [[ "$BUCKET" == */* ]]; then
+    echo "ERROR: bucket must be a bucket name only (got '$BUCKET'). Configure a bucket, not a bucket/prefix path." >&2
+    exit 2
+fi
+
 # Trim + drop blanks, dedupe (keep order).
 _cleaned=()
 for h in "${HOSTNAMES[@]:-}"; do

@@ -39,6 +39,12 @@ param(
     # created under a different name.
     [string]$BackupId = "",
 
+    # The restic password is shared by every laptop/account. Overwriting it
+    # does NOT rekey existing repositories, so changing it makes them
+    # unreadable. This switch is required to replace an existing password
+    # file; only use it together with `restic key add/remove` on every repo.
+    [switch]$RotateRepositoryPassword,
+
     # Optional overrides for the shared backup-config.json values.
     [string]$WasabiEndpoint = "",
     [string]$BucketAndPrefix = ""
@@ -110,6 +116,69 @@ if (-not $BucketAndPrefix) {
     }
 }
 
+# Normalise whitespace/trailing slashes, then reject path prefixes: the repo
+# layout is one repository per top-level bucket prefix, and the fleet tools'
+# discovery cannot represent bucket/prefix combinations.
+$WasabiEndpoint = "$WasabiEndpoint".Trim().TrimEnd('/')
+$BucketAndPrefix = "$BucketAndPrefix".Trim().TrimEnd('/')
+if (-not $WasabiEndpoint -or -not $BucketAndPrefix) {
+    throw "Wasabi endpoint and bucket must not be empty."
+}
+if ($BucketAndPrefix -match '/') {
+    throw "bucketAndPrefix must be a bucket name only (found '$BucketAndPrefix')."
+}
+
+# ---- Identity helpers ----
+function Get-AccountSid {
+    param([string]$Identity)
+    $t = "$Identity".Trim()
+    if (-not $t) { return $null }
+    if ($t -match '^S-1-5-') { return $t }
+    try {
+        return (New-Object System.Security.Principal.NTAccount($t)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+    } catch { return $null }
+}
+
+# icacls accepts `*<SID>`; using SIDs avoids localised well-known names
+# (BUILTIN\Administrators) and SID-vs-name mismatches between the task
+# principal and the ACL grant.
+function Resolve-AclIdentity {
+    param([string]$Identity)
+    $t = "$Identity".Trim()
+    if (-not $t) { return $null }
+    if ($t -eq 'SYSTEM') { return '*S-1-5-18' }
+    if ($t -eq 'BUILTIN\Administrators') { return '*S-1-5-32-544' }
+    if ($t -match '^S-1-5-') { return "*$t" }
+    try {
+        $sid = (New-Object System.Security.Principal.NTAccount($t)).Translate([System.Security.Principal.SecurityIdentifier])
+        return "*$($sid.Value)"
+    } catch {
+        Write-Warning "Could not resolve '$t' to a SID; granting by name instead."
+        return $t
+    }
+}
+
+# Stops powershell processes running a specific deployed watcher script. Used
+# before re-registering a task: the watcher loops forever, so removing the
+# task definition alone can leave the old instance running.
+function Stop-AgentWatcher {
+    param([string]$ScriptPath, [int]$ExcludePid = 0)
+    if (-not $ScriptPath) { return 0 }
+    $pattern = '*' + [System.Management.Automation.WildcardPattern]::Escape($ScriptPath) + '*'
+    $stopped = 0
+    try {
+        $procs = Get-CimInstance -ClassName Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction Stop |
+            Where-Object { $_.CommandLine -and $_.CommandLine -like $pattern -and $_.ProcessId -ne $ExcludePid }
+        foreach ($p in $procs) {
+            try {
+                Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop
+                $stopped++
+            } catch { }
+        }
+    } catch { }
+    return $stopped
+}
+
 # ---- Re-launch elevated if not already admin ----
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
@@ -121,6 +190,7 @@ if (-not $isAdmin) {
     }
     if ($PerAccount) { $fwdArgs += " -PerAccount" }
     if ($BackupId) { $fwdArgs += " -BackupId `"$BackupId`"" }
+    if ($RotateRepositoryPassword) { $fwdArgs += " -RotateRepositoryPassword" }
     if ($WasabiEndpoint) { $fwdArgs += " -WasabiEndpoint `"$WasabiEndpoint`"" }
     if ($BucketAndPrefix) { $fwdArgs += " -BucketAndPrefix `"$BucketAndPrefix`"" }
     Start-Process powershell -Verb RunAs -ArgumentList $fwdArgs
@@ -128,9 +198,12 @@ if (-not $isAdmin) {
 }
 
 # ---- Resolve the account, backup ID, directories and task name ----
-# Prefer the logged-on console user, NOT $env:USERNAME (under elevation that
-# is the IT admin, whose Documents/Desktop are not what we want to back up).
-# -TaskUser overrides.
+# In per-account mode the target MUST be explicit: if an administrator
+# elevates to install another user's agent, console auto-detection can pick
+# the administrator's own account and silently register the wrong task.
+if ($PerAccount -and -not $TaskUser) {
+    throw "Per-account mode requires -TaskUser (for example -TaskUser `"$env:COMPUTERNAME\Acc2`"). Auto-detection is ambiguous when an administrator elevates to install another account."
+}
 if (-not $TaskUser) {
     $loggedOn = $null
     try { $loggedOn = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).UserName } catch { }
@@ -138,8 +211,38 @@ if (-not $TaskUser) {
     else { $TaskUser = "$env:USERDOMAIN\$env:USERNAME" }
 }
 
-$HostName    = $env:COMPUTERNAME
-$AccountName = ($TaskUser -split '\\')[-1]
+$HostName = $env:COMPUTERNAME
+$TaskUserSid = $null
+$CanonicalTaskUser = $TaskUser
+
+if ($PerAccount) {
+    # Resolve to a SID: validates the account, gives Windows' canonical
+    # spelling (Acc2 vs acc2), and lets the ACL grant use a SID instead of a
+    # name that may not resolve.
+    try {
+        $sid = (New-Object System.Security.Principal.NTAccount($TaskUser)).Translate([System.Security.Principal.SecurityIdentifier])
+        $TaskUserSid = $sid.Value
+        $CanonicalTaskUser = $sid.Translate([System.Security.Principal.NTAccount]).Value
+    } catch {
+        throw "Could not resolve account '$TaskUser'. Use COMPUTER\account for a local account. $($_.Exception.Message)"
+    }
+    $TaskUser = $CanonicalTaskUser
+
+    # The profile (and therefore Desktop/Documents) must exist before
+    # installing: the agent resolves known folders at startup and has nothing
+    # to watch otherwise.
+    $profile = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue |
+        Where-Object { $_.SID -eq $TaskUserSid } |
+        Select-Object -First 1
+    if (-not $profile -or -not $profile.LocalPath -or -not (Test-Path -LiteralPath $profile.LocalPath)) {
+        throw "No Windows profile found for $TaskUser. Log in as that account once (so its profile and Desktop are created), then re-run the installer."
+    }
+    if ($profile.Loaded) {
+        Write-Host "Profile for $TaskUser is loaded (good: Desktop/Documents exist)."
+    }
+}
+
+$AccountName = ($CanonicalTaskUser -split '\\')[-1]
 # Account names can contain spaces/dots/accented characters. Keep the repo,
 # task and folder names conservative so S3 prefixes and icacls stay simple.
 $SafeAccount = ($AccountName -replace '[^A-Za-z0-9._-]', '-').Trim('-')
@@ -147,8 +250,13 @@ $SafeAccount = ($AccountName -replace '[^A-Za-z0-9._-]', '-').Trim('-')
 if ($PerAccount -and -not $SafeAccount) {
     throw "Could not derive an account name from '$TaskUser'. Pass -TaskUser COMPUTER\account."
 }
+
+$BackupIdWasProvided = [bool]$BackupId
 if ($PerAccount -and -not $BackupId) { $BackupId = "$HostName-$SafeAccount" }
 if (-not $BackupId) { $BackupId = $HostName }
+if (($PerAccount -or $BackupIdWasProvided) -and $BackupId -notmatch '^[A-Za-z0-9._-]+$') {
+    throw "Backup ID '$BackupId' contains unsupported characters. Use only letters, digits, dot, underscore and hyphen."
+}
 $Tag = $BackupId
 
 $BaseConfigDir = "$env:ProgramData\DocBackup"
@@ -165,6 +273,37 @@ $ExcludeFile    = Join-Path $ConfigDir "excludes.txt"
 $ExtraPathsFile = Join-Path $ConfigDir "extra-paths.txt"
 $TaskName       = if ($PerAccount) { "DocumentsBackupSync-$SafeAccount" } else { "DocumentsBackupSync" }
 $Repository     = "s3:$WasabiEndpoint/$BucketAndPrefix/$BackupId"
+
+# ---- Preflight: mode and task-name conflicts ----
+# Checked BEFORE any credentials/files are touched, so an aborted run leaves
+# the machine exactly as it was.
+
+# Mixing modes on one laptop silently creates a second agent that uploads the
+# console user's profile again into the legacy repo. Refuse rather than guess.
+if (-not $PerAccount) {
+    $perAccountTasks = @()
+    try {
+        $perAccountTasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue |
+            Where-Object { $_.TaskPath -eq '\' -and $_.TaskName -like 'DocumentsBackupSync-*' })
+    } catch { }
+    if ($perAccountTasks.Count -gt 0) {
+        throw "This laptop already uses per-account mode ($(($perAccountTasks | ForEach-Object { $_.TaskName }) -join ', ')). Re-run with -PerAccount -TaskUser COMPUTER\account to add or repair an account. A legacy per-laptop task would back up the same files a second time under '$HostName'."
+    }
+}
+
+# Sanitised account names can collide ("Acc 2" and "Acc-2" both map to
+# Acc-2), and the task name is case-insensitive while S3 prefixes are not.
+# If a task with this name already exists under a different account, abort
+# instead of overwriting another user's agent.
+$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($existingTask) {
+    $existingUser = "$($existingTask.Principal.UserId)"
+    $existingSid = Get-AccountSid -Identity $existingUser
+    $desiredSid = if ($TaskUserSid) { $TaskUserSid } else { Get-AccountSid -Identity $TaskUser }
+    if ($existingSid -and $desiredSid -and $existingSid -ne $desiredSid) {
+        throw "Task '$TaskName' already exists and runs as '$existingUser', not '$TaskUser'. Refusing to overwrite another account's agent (account names may differ only in characters that sanitise to the same value). Uninstall the other agent first, or pass a distinct -BackupId."
+    }
+}
 
 # restic location: prefer an existing install in either Program Files root
 # (a 32-bit PowerShell session reports Program Files (x86)).
@@ -229,6 +368,20 @@ if ($savedSecret) {
         [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecretKeySecure)
     )
 }
+
+# Changing shared keys affects every agent on this laptop: running processes
+# keep the old values until restarted, later starts use the new ones. Require
+# deliberate confirmation so a typo cannot silently break them.
+if ($savedAccess -or $savedSecret) {
+    $keysChanged = (($savedAccess -and $AccessKey -ne $savedAccess) -or
+                    ($savedSecret -and $SecretKey -ne $savedSecret))
+    if ($keysChanged) {
+        Write-Warning "You are changing the shared Wasabi keys used by every backup agent on this laptop."
+        Write-Host "  Running agents keep the old keys until restarted; a typo will break their next backup."
+        $confirmKeys = Read-Host "Type YES to change the shared Wasabi keys"
+        if ($confirmKeys -ne 'YES') { throw "Aborted: Wasabi keys left unchanged." }
+    }
+}
 if ($savedPwExists) {
     $inPwSecure = Read-Host "Enter the restic repository encryption password [Enter to keep existing file]" -AsSecureString
     $inPw = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
@@ -251,6 +404,27 @@ if ($savedPwExists) {
     $ResticPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
         [Runtime.InteropServices.Marshal]::SecureStringToBSTR($ResticPasswordSecure)
     )
+}
+
+# Never silently replace the fleet-wide repository password: overwriting the
+# file does NOT rekey existing repositories, it just makes them unreadable.
+$newPassword = "$ResticPassword".TrimEnd("`r", "`n")
+if (-not $newPassword) { throw "The restic repository password cannot be empty." }
+
+$existingPassword = $null
+$existingPasswordSource = $null
+if ($savedPwExists) { $existingPasswordSource = $effectivePwFile }
+elseif (Test-Path -LiteralPath $PasswordFile) { $existingPasswordSource = $PasswordFile }
+if ($existingPasswordSource) {
+    try {
+        $existingPassword = (Get-Content -Path $existingPasswordSource -Raw -ErrorAction Stop).TrimEnd("`r", "`n")
+    } catch { }
+}
+if ($null -ne $existingPassword -and $newPassword -ne $existingPassword) {
+    if (-not $RotateRepositoryPassword) {
+        throw "A shared restic password already exists at '$existingPasswordSource'. Overwriting it does NOT rekey existing repositories and makes them unreadable. Re-run and press Enter to keep the existing password, or pass -RotateRepositoryPassword only after adding the new key to every repository (restic key add)."
+    }
+    Write-Warning "Replacing the shared restic password. Existing repositories are NOT rekeyed until you run 'restic key add' on each of them."
 }
 if (-not $ExtraPaths -or $ExtraPaths.Count -eq 0) {
     $extraAnswer = Read-Host "Extra folders to back up on THIS laptop, comma-separated (e.g. C:\Users\Public) [Enter to skip]"
@@ -285,6 +459,23 @@ if (-not (Test-Path $resticExe)) {
     Write-Host "restic installed to $InstallDir"
 } else {
     Write-Host "restic already installed, skipping download."
+}
+
+# sync-documents.ps1 uses --skip-if-unchanged, which requires restic >= 0.16.
+# An old pre-installed binary would otherwise fail every backup with an
+# "unknown flag" error.
+$versionText = (& $resticExe version 2>&1 | Out-String)
+if ($LASTEXITCODE -ne 0) {
+    throw "restic at $resticExe could not be executed (exit code $LASTEXITCODE). Fix or delete it, then re-run."
+}
+if ($versionText -match 'restic\s+(\d+)\.(\d+)\.(\d+)') {
+    $verMajor = [int]$Matches[1]
+    $verMinor = [int]$Matches[2]
+    if ($verMajor -eq 0 -and $verMinor -lt 16) {
+        throw "restic $verMajor.$verMinor found. Version 0.16 or newer is required (--skip-if-unchanged). Upgrade restic or delete $resticExe so the installer downloads the current release."
+    }
+} else {
+    Write-Warning "Could not determine the restic version from: $($versionText.Trim())"
 }
 
 # Add to machine PATH if not already present
@@ -332,11 +523,17 @@ Show-InstallProgress -Step 3 -Status "Securing repository password"
 # Reset any ACL left over from a previous install run before writing, so this
 # script is safe to re-run.
 Write-Host "Scheduled task will run as: $TaskUser"
-if (Test-Path $PasswordFile) {
-    icacls $PasswordFile /reset | Out-Null
+if (Test-Path -LiteralPath $PasswordFile) {
+    & icacls $PasswordFile /reset | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not reset the ACL on $PasswordFile (icacls exit code $LASTEXITCODE)."
+    }
 }
-Set-Content -Path $PasswordFile -Value $ResticPassword -NoNewline
-icacls $PasswordFile /inheritance:r | Out-Null
+Set-Content -Path $PasswordFile -Value $newPassword -NoNewline -ErrorAction Stop
+& icacls $PasswordFile /inheritance:r | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not disable inheritance on $PasswordFile (icacls exit code $LASTEXITCODE)."
+}
 
 $grantIdentities = @("SYSTEM", "BUILTIN\Administrators", $TaskUser)
 try {
@@ -351,13 +548,30 @@ $uniqueIds = @()
 foreach ($id in $grantIdentities) {
     $t = "$id".Trim()
     if (-not $t) { continue }
-    $key = $t.ToLowerInvariant()
+    $resolved = Resolve-AclIdentity -Identity $t
+    if (-not $resolved) { continue }
+    $key = "$resolved".ToLowerInvariant()
     if ($seenIds.ContainsKey($key)) { continue }
     $seenIds[$key] = $true
-    $uniqueIds += $t
+    $uniqueIds += $resolved
 }
 $aclArgs = @($PasswordFile, "/grant:r") + @($uniqueIds | ForEach-Object { "${_}:(R)" })
 & icacls @aclArgs | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not grant read access on $PasswordFile to: $($uniqueIds -join ', ') (icacls exit code $LASTEXITCODE). No backup will work until this is fixed."
+}
+
+# Per-account agents write their own logs/state/excludes, so make sure that
+# account can modify its own directory (inherited ProgramData permissions are
+# not guaranteed to allow file creation). The base directory and password
+# file are deliberately not granted to task users.
+if ($PerAccount) {
+    $configDirGrant = "$(Resolve-AclIdentity -Identity $TaskUser):(OI)(CI)M"
+    & icacls $ConfigDir /grant $configDirGrant | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not grant modify access on $ConfigDir to $TaskUser (icacls exit code $LASTEXITCODE). The agent would be unable to write its log."
+    }
+}
 
 # ---- 4. Set machine-wide environment variables restic needs ----
 Show-InstallProgress -Step 4 -Status "Setting environment variables"
@@ -388,13 +602,23 @@ Write-Host "Repository target: $Repository"
 
 # ---- 5. Initialize the repository if it doesn't already exist ----
 Show-InstallProgress -Step 5 -Status "Initializing repository"
-& $resticExe snapshots > $null 2>&1
-if ($LASTEXITCODE -ne 0) {
+# restic returns non-zero for "no repo here" AND for auth/network errors.
+# Blindly running init on the latter produces a misleading "check
+# credentials/bucket" message, so match the missing-repository wording first
+# and surface anything else verbatim.
+$snapOut = (& $resticExe snapshots 2>&1 | Out-String)
+$snapCode = $LASTEXITCODE
+if ($snapCode -ne 0) {
+    $repoMissing = $snapOut -match 'Is there a repository at the following location\?|repository does not exist|unable to open config file'
+    if (-not $repoMissing) {
+        Write-Progress -Activity "Installing Documents Backup Agent ($HostName)" -Completed
+        throw "restic could not open repository '$Repository' (exit code $snapCode):`n$($snapOut.Trim())`nFix the endpoint, bucket, keys or network access, then re-run. Repository was NOT initialised."
+    }
     Write-Host "Initializing new restic repository..."
-    & $resticExe init
+    $initOut = (& $resticExe init 2>&1 | Out-String)
     if ($LASTEXITCODE -ne 0) {
         Write-Progress -Activity "Installing Documents Backup Agent ($HostName)" -Completed
-        throw "restic init failed - check Wasabi credentials/bucket name and try again."
+        throw "restic init failed (exit code $LASTEXITCODE):`n$($initOut.Trim())`nCheck that the bucket exists and the Wasabi credentials allow writes."
     }
     Write-Host "Repository initialized and encrypted."
 } else {
@@ -449,9 +673,42 @@ if (Test-Path $sourceRetention) {
 # ---- 7. Register Scheduled Task: run at logon, restart on failure ----
 Show-InstallProgress -Step 7 -Status "Registering scheduled task"
 
-# In per-account mode this only touches THIS account's task, so installing
-# Acc2 never unregisters Acc1. In legacy mode the name is unchanged.
-Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+# Mode/task-name conflicts were checked before anything was changed. Here the
+# old task (if any) is stopped first: the watcher is a `while ($true)`
+# process, so unregistering alone can leave it running and you end up with
+# two agents contending for the same repository.
+if ($existingTask) {
+    Write-Host "Replacing existing task '$TaskName' (runs as '$($existingTask.Principal.UserId)')."
+    if ("$($existingTask.State)" -eq 'Running') {
+        try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop } catch {
+            Write-Warning "Could not stop the existing task: $($_.Exception.Message)"
+        }
+        $stopDeadline = (Get-Date).AddSeconds(30)
+        $state = ''
+        while ((Get-Date) -lt $stopDeadline) {
+            $state = "$((Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue).State)"
+            if ($state -ne 'Running') { break }
+            Start-Sleep -Milliseconds 500
+        }
+        if ($state -eq 'Running') {
+            Write-Warning "Task '$TaskName' did not stop within 30s; terminating its watcher process directly."
+        }
+    }
+}
+
+$killed = Stop-AgentWatcher -ScriptPath $ScriptDest -ExcludePid $PID
+if ($killed -gt 0) {
+    Write-Host "Terminated $killed orphaned watcher process(es) left over from a previous install."
+    Start-Sleep -Seconds 2
+}
+
+if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    try {
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+    } catch {
+        throw "Could not remove the existing task '$TaskName': $($_.Exception.Message). Stop it in Task Scheduler, or reboot, then re-run."
+    }
+}
 
 $actionArgument = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptDest`""
 if ($PerAccount) {
@@ -483,9 +740,40 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
 
 Write-Host "Scheduled task '$TaskName' registered (starts at logon, auto-restarts)."
 
-# ---- 8. Start it now for this session too ----
+# ---- 8. Start it now and confirm it actually launched ----
 Show-InstallProgress -Step 8 -Status "Starting backup task"
-Start-ScheduledTask -TaskName $TaskName
+try {
+    Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+} catch {
+    throw "The task '$TaskName' was registered but could not be started: $($_.Exception.Message). Open Task Scheduler and start it manually to see the error."
+}
+
+# An S4U principal can be rejected at start time (blank password, policy,
+# account deleted). Without this check the installer would print "complete"
+# for an agent that never runs.
+$startDeadline = (Get-Date).AddSeconds(30)
+$taskState = ''
+$taskInfo = $null
+while ((Get-Date) -lt $startDeadline) {
+    Start-Sleep -Seconds 2
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $taskState = "$($task.State)"
+    $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($taskState -eq 'Running') { break }
+}
+
+if ($taskState -ne 'Running') {
+    $result = if ($taskInfo) { $taskInfo.LastTaskResult } else { 'unknown' }
+    $hint = switch ("$result") {
+        '2147942405' { 'Access is denied - the account cannot read the deployed script, config dir or restic password.' }
+        '2147943726' { 'Logon failure - S4U could not create a token for this account (blank password or policy).' }
+        '267011'     { 'The task has not run yet - check the trigger and Start-ScheduledTask result.' }
+        default      { 'See sync.log and the Task Scheduler history for details.' }
+    }
+    throw "Task '$TaskName' was registered but is not running (state: '$taskState', LastTaskResult: $result). $hint"
+}
+
+Write-Host "Task '$TaskName' started successfully (state: Running)."
 Write-Progress -Activity "Installing Documents Backup Agent ($HostName)" -Completed
 
 Write-Host ""

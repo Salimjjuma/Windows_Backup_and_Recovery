@@ -126,11 +126,12 @@ if ($remainingTasks.Count -eq 0) {
         }
     }
 
-    if (Test-Path $PasswordFile) {
+    if (Test-Path -LiteralPath $PasswordFile) {
         # The file is ACL'd read-only for SYSTEM/Administrators/task users
         # with inheritance disabled, so take rights back before deleting.
-        icacls $PasswordFile /reset 2>$null | Out-Null
-        icacls $PasswordFile /grant:r "BUILTIN\Administrators:(F)" "SYSTEM:(F)" 2>$null | Out-Null
+        # SIDs, not localised group names.
+        & icacls $PasswordFile /reset 2>$null | Out-Null
+        & icacls $PasswordFile /grant:r "*S-1-5-32-544:(F)" "*S-1-5-18:(F)" 2>$null | Out-Null
         try {
             Remove-Item -Path $PasswordFile -Force -ErrorAction Stop
             Write-Host "Password file deleted: $PasswordFile"

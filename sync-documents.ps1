@@ -69,16 +69,21 @@ if (-not $ConfigDir) { $ConfigDir = "$env:ProgramData\DocBackup" }
 # Shared endpoint/bucket/excludes. Optional: if the file is absent (e.g. an
 # old deployment that has not been re-installed yet) the built-in defaults
 # below are used, matching the original hard-coded behaviour.
+$script:BackupConfigError = $null
 function Read-BackupConfigFile {
     param([string]$Dir)
     $path = Join-Path $Dir "backup-config.json"
-    if (Test-Path $path) {
-        try {
-            return Get-Content -Path $path -Raw -ErrorAction Stop |
-                ConvertFrom-Json -ErrorAction Stop
-        } catch { return $null }
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try {
+        return Get-Content -Path $path -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        # Legacy mode tolerates this (falls back to RESTIC_REPOSITORY), but
+        # per-account mode must not: silently using the legacy repo would mix
+        # two accounts' snapshots together.
+        $script:BackupConfigError = "$path could not be read: $($_.Exception.Message)"
+        return $null
     }
-    return $null
 }
 $BackupConfig = Read-BackupConfigFile -Dir $ConfigDir
 
@@ -100,10 +105,15 @@ if ($BackupConfig -and $BackupConfig.excludes) {
     $EffectiveExcludes = @($BackupConfig.excludes | ForEach-Object { "$_" })
 }
 
+# Resolve the known folders both raw and filtered, and keep the raw values for
+# diagnostics: an empty result here means the agent would run restic with no
+# paths and fail every cycle, which must be logged explicitly.
+$RawDocuments = [Environment]::GetFolderPath("MyDocuments")
+$RawDesktop   = [Environment]::GetFolderPath("Desktop")
 $SourcePaths = @(
-    [Environment]::GetFolderPath("MyDocuments"),
-    [Environment]::GetFolderPath("Desktop")
-) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+    $RawDocuments,
+    $RawDesktop
+) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
 
 $HostName       = $env:COMPUTERNAME
 $Tag            = if ($BackupId) { $BackupId } else { $HostName }
@@ -190,16 +200,33 @@ function Write-Log {
 # backup-config.json so two tasks on one machine can point at two repos.
 # Legacy mode: keep using RESTIC_REPOSITORY exactly as before.
 $ConfiguredRepo = $null
-if ($BackupConfig -and $BackupConfig.wasabiEndpoint -and $BackupConfig.bucketAndPrefix) {
-    $ConfiguredRepo = "s3:$($BackupConfig.wasabiEndpoint)/$($BackupConfig.bucketAndPrefix)/$Tag"
+$cfgEndpoint = ""
+$cfgBucket   = ""
+if ($BackupConfig) {
+    $cfgEndpoint = "$($BackupConfig.wasabiEndpoint)".Trim().TrimEnd('/')
+    $cfgBucket   = "$($BackupConfig.bucketAndPrefix)".Trim().TrimEnd('/')
 }
+$configProblem = $null
+if (-not $BackupConfig) {
+    $configProblem = if ($script:BackupConfigError) { $script:BackupConfigError } else { "backup-config.json not found in $ConfigDir" }
+} elseif (-not $cfgEndpoint -or -not $cfgBucket) {
+    $configProblem = "backup-config.json is missing wasabiEndpoint and/or bucketAndPrefix ($ConfigDir)"
+} elseif ($cfgBucket.Contains('/')) {
+    $configProblem = "bucketAndPrefix must be a bucket name only, without '/' (found '$cfgBucket')"
+}
+if (-not $configProblem) {
+    $ConfiguredRepo = "s3:$cfgEndpoint/$cfgBucket/$Tag"
+}
+
 if ($BackupId) {
-    if ($ConfiguredRepo) {
-        $Repository = $ConfiguredRepo
-    } else {
-        Write-Log "WARNING: backup-config.json missing or incomplete - falling back to RESTIC_REPOSITORY for the per-account repo."
-        $Repository = $env:RESTIC_REPOSITORY
+    # No fallback in per-account mode. Falling back to RESTIC_REPOSITORY would
+    # upload this account into the legacy per-laptop repo under a different
+    # tag, which silently corrupts restore assumptions for both.
+    if ($configProblem) {
+        Write-Log "FATAL: per-account mode is configured but $configProblem. Refusing to fall back to RESTIC_REPOSITORY. Agent cannot continue."
+        exit 1
     }
+    $Repository = $ConfiguredRepo
 } else {
     $Repository = if ($env:RESTIC_REPOSITORY) { $env:RESTIC_REPOSITORY } else { $ConfiguredRepo }
 }
@@ -227,6 +254,15 @@ if (Test-Path $ExtraPathsFile) {
     if ($ExtraPaths) {
         $SourcePaths = @($SourcePaths + $ExtraPaths | Select-Object -Unique)
     }
+}
+
+# A per-account agent started before the profile exists (or with redirected
+# folders that S4U cannot reach) has nothing to back up. restic then fails
+# every cycle with a confusing argument error, and a running watcher never
+# re-evaluates the folder list, so this must stop loudly instead.
+if (-not $SourcePaths -or @($SourcePaths).Count -eq 0) {
+    Write-Log "FATAL: no existing source paths. Documents='$RawDocuments' Desktop='$RawDesktop' ExtraPathsFile='$ExtraPathsFile'. If this account has never logged in, log in once so its profile is created, then restart the task."
+    exit 1
 }
 
 function Invoke-Backup {
@@ -339,6 +375,7 @@ try {
     Write-Log "sync.log rotation skipped: $_"
 }
 Write-Log "Watched paths: $($SourcePaths -join ', ')"
+Write-Log "Resolved known folders: Documents='$RawDocuments' Desktop='$RawDesktop'"
 Write-Log "Exclude file: $ExcludeFile"
 Write-Log "Max file size: ${MaxFileSizeMB}MB"
 Write-Log "Retention policy: keep-daily $KeepDaily, keep-weekly $KeepWeekly, keep-monthly $KeepMonthly (from $RetentionFile)"
